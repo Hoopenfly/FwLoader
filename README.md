@@ -1,5 +1,7 @@
 # FwLoader
 
+[![Release](https://img.shields.io/github/v/release/Hoopenfly/FwLoader?label=release)](https://github.com/Hoopenfly/FwLoader/releases)
+
 嵌入式固件升级库（目前仅在 STM32L071CZT6 实机验证过）。
 
 **库版本：v1.0.0**。同一版本号维护在 `library/inc/fw_msg.h` 的 `FW_LIB_VERSION`，发布时以本仓库的 Git tag 为准。
