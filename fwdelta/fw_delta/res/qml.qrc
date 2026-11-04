@@ -1,0 +1,13 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="qml/main.qml">../qml/main.qml</file>
+        <file alias="qml/Card.qml">../qml/Card.qml</file>
+        <file alias="qml/SectionTitle.qml">../qml/SectionTitle.qml</file>
+        <file alias="qml/StatusBar.qml">../qml/StatusBar.qml</file>
+        <file alias="qml/CustomTextField.qml">../qml/CustomTextField.qml</file>
+        <file alias="qml/CustomComboBox.qml">../qml/CustomComboBox.qml</file>
+        <file alias="qml/CustomButton.qml">../qml/CustomButton.qml</file>
+        <file alias="qml/FormRow.qml">../qml/FormRow.qml</file>
+        <file alias="qml/HintTip.qml">../qml/HintTip.qml</file>
+    </qresource>
+</RCC>

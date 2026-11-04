@@ -201,9 +201,16 @@ void fw_port_irq_enable(void)
   __enable_irq();
 }
 
-/* 编译期校验：平台接收缓冲必须放得下最长的IAP帧 */
+/* 编译期校验：接收缓冲必须放得下最长的IAP帧。
+ * FW_PORT_RX_BUF_SIZE 是库侧的期望值；平台若在实现头里给出真实队列容量
+ * PORT_RX_BUF_SIZE，则再按真实值校验一次，避免只有库侧自证。 */
 #if (FW_IAP_RX_FRAME_MAX > FW_PORT_RX_BUF_SIZE)
 	#error "FW_PORT_RX_BUF_SIZE is too small for IAP frames"
+#endif
+#ifdef PORT_RX_BUF_SIZE
+	#if (FW_IAP_RX_FRAME_MAX > PORT_RX_BUF_SIZE)
+		#error "PORT_RX_BUF_SIZE is too small for IAP frames"
+	#endif
 #endif
 /* ==================== 跳转 ==================== */
 

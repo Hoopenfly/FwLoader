@@ -81,6 +81,10 @@ int fw_port_flash_read(uint32_t addr, uint8_t *buf, uint32_t size);
 * @param   buf   数据缓冲区
 * @param   size  写入字节数
 * @return  0成功，非0失败
+* @note    addr 与 size 都可能不是写粒度(FW_FLASH_WRITE_BYTE)的整数倍，实现方须
+*          按粒度读-改-写自行对齐：先读出该粒度内未被本次覆盖的字节，拼上待写数据
+*          后整粒度编程。库层按协议帧直接下发偏移与长度，不做补齐。
+*          待写区域必须是已擦除态，本函数不负责擦除。
 */
 int fw_port_flash_write(uint32_t addr, const uint8_t *buf, uint32_t size);
 

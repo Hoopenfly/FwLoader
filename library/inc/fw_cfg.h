@@ -51,13 +51,30 @@
 
 /* ==================== 二、器件能力 ==================== */
 /* 库据此切分擦写、校验串口缓冲；取值必须与平台器件一致。 */
-#define FW_FLASH_PAGE_SIZE     128u   //主Flash单次擦除的页大小(字节)
-#define FW_FLASH_WRITE_BYTE    4u     //主Flash一次可编程的最小字节数
-#define FW_EEPROM_PAGE_SIZE    4u     //数据EEPROM按字(4字节)擦除/编程
-#define FW_EEPROM_WRITE_BYTE   4u     //数据EEPROM写粒度
+/* 构建日期：默认取编译器日期；需要完全可复现时在工程选项里固定成"yyyy-mm-dd"，
+ * 这样同一份源码跨天编译也能得到逐字节一致的镜像，差分率更稳定。 */
+#ifndef FW_BUILD_DATE
+  #define FW_BUILD_DATE  __DATE__
+#endif
+
+/* 以下器件能力宏都可由工程选项覆盖：换器件时在工程里定义同名宏即可，不必改本文件。 */
+#ifndef FW_FLASH_PAGE_SIZE
+  #define FW_FLASH_PAGE_SIZE   128u   //主Flash单次擦除的页大小(字节)
+#endif
+#ifndef FW_FLASH_WRITE_BYTE
+  #define FW_FLASH_WRITE_BYTE  4u     //主Flash一次可编程的最小字节数
+#endif
+#ifndef FW_EEPROM_PAGE_SIZE
+  #define FW_EEPROM_PAGE_SIZE  4u     //数据EEPROM按字(4字节)擦除/编程
+#endif
+#ifndef FW_EEPROM_WRITE_BYTE
+  #define FW_EEPROM_WRITE_BYTE 4u     //数据EEPROM写粒度
+#endif
 
 /* 平台串口接收缓冲的字节数：库用它做编译期校验，保证放得下最长的IAP帧 */
-#define FW_PORT_RX_BUF_SIZE    340u
+#ifndef FW_PORT_RX_BUF_SIZE
+  #define FW_PORT_RX_BUF_SIZE  340u
+#endif
 
 /* 平台后端沿用的名字(它们不包含库头文件，只用这些宏描述自身器件)。
  * 库内一律使用上面的 FW_* 名字；FLASH_PAGE_SIZE 由平台HAL提供，此处不再定义。 */
@@ -66,15 +83,36 @@
 #define EEPROM_WRITE_BYTE      FW_EEPROM_WRITE_BYTE
 
 /* ==================== 三、板级布局 ==================== */
+
+/* 固件水印：本工程的项目编号。打包时写进镜像元数据，设备侧比对，不符即拒绝，
+ * 避免不同项目的固件互相刷入。编号与项目名的对应关系由工程自行维护。 */
+#ifndef FW_IMG_PROJECT_ID
+  #define FW_IMG_PROJECT_ID    0x00000001u
+#endif
+
 /* ==================== Flash ==================== */
-#define FLASH_BASE_ADDR   0x08000000
-#define FLASH_TOTAL_SIZE  (192 * 1024)  //192KB
-#define FLASH_WRITE_GRA   32  //32位
+/* 以下板级布局宏都可由工程选项覆盖：板级配置在工程里定义同名宏即可，不必改本文件。
+ * 各分区的起始地址由基础宏推导，覆盖基础宏后自动跟随。 */
+#ifndef FLASH_BASE_ADDR
+  #define FLASH_BASE_ADDR   0x08000000
+#endif
+#ifndef FLASH_TOTAL_SIZE
+  #define FLASH_TOTAL_SIZE  (192 * 1024)  //192KB
+#endif
+#ifndef FLASH_WRITE_GRA
+  #define FLASH_WRITE_GRA   32  //32位
+#endif
 
 
-#define FW_BOOT_SIZE         0x00008000  //32KB
-#define SLOT_SIZE         0x00010000  //64KB
-#define STAGE_SIZE        (32 * 1024)  //32KB
+#ifndef FW_BOOT_SIZE
+  #define FW_BOOT_SIZE      0x00008000  //32KB
+#endif
+#ifndef SLOT_SIZE
+  #define SLOT_SIZE         0x00010000  //64KB
+#endif
+#ifndef STAGE_SIZE
+  #define STAGE_SIZE        (32 * 1024)  //32KB
+#endif
 
 #define FW_BOOT_ADDR         FLASH_BASE_ADDR
 #define SLOT0_ADDR        (FW_BOOT_ADDR + FW_BOOT_SIZE)
@@ -82,14 +120,26 @@
 #define STAGE_ADDR        (SLOT1_ADDR + SLOT_SIZE)
 
 /* ==================== EEPROM ==================== */
-#define EEPROM_BASE_ADDR  0x08080000  //片内数据EEPROM基地址
-#define EEPROM_TOTAL_SIZE (6 * 1024)  //6KB
-#define EEPROM_WRITE_GRA  32  //设置写入粒度为32位
+#ifndef EEPROM_BASE_ADDR
+  #define EEPROM_BASE_ADDR  0x08080000  //片内数据EEPROM基地址
+#endif
+#ifndef EEPROM_TOTAL_SIZE
+  #define EEPROM_TOTAL_SIZE (6 * 1024)  //6KB
+#endif
+#ifndef EEPROM_WRITE_GRA
+  #define EEPROM_WRITE_GRA  32  //设置写入粒度为32位
+#endif
 
 /* ==================== RAM ==================== */
-#define RAM_BASE_ADDR     0x20000000
-#define RAM_TOTAL_SIZE    (20 * 1024)  //20KB
-#define RAM_END_ADDR      (RAM_BASE_ADDR + RAM_TOTAL_SIZE)
+#ifndef RAM_BASE_ADDR
+  #define RAM_BASE_ADDR     0x20000000
+#endif
+#ifndef RAM_TOTAL_SIZE
+  #define RAM_TOTAL_SIZE    (20 * 1024)  //20KB
+#endif
+#ifndef RAM_END_ADDR
+  #define RAM_END_ADDR      (RAM_BASE_ADDR + RAM_TOTAL_SIZE)
+#endif
 
 /* ==================== 各分区扇区大小 ==================== */
 //暂存区扇区大小
@@ -116,19 +166,18 @@
    FW_FLASH_PAGE_SIZE,  FW_KV_OPS(fw_port_flash_read, fw_port_flash_write, fw_port_flash_erase)},                \
 }
 
-/* ==================== fw_kv 键值(全工程唯一处) ==================== */
-/* 全工程用到的键统一在这里编号(0x01起)，加键就加一项。键是在分区内取值的，
- * 不同分区可以重复，统一编号只为集中维护；0不用(fw_kv视为非法键)；
+/* ==================== fw_kv 键值(库内核部分) ==================== */
+/* 这里只放升级流程自身用到的键，由 fw_boot.c 读写。
+ * 键是在分区内取值的，不同分区可以重复；0不用(fw_kv视为非法键)；
  * fw_kv接口收uint32_t，本枚举只是给调用方看的"键名表"。
+ * 应用层业务键(标定数据、通信波特率等)由使用方在自己的头文件里按分区编号，
+ * 库不感知；镜像大小与版本取自镜像元数据的 image_len / image_ver，不另存KV。
  */
 typedef enum
 {
   FW_KV_KEY_BOOT_FLAG     = 0x01,   //OTA升级标志        (分区STAGE，fw_boot.c)
   FW_KV_KEY_BOOT_PROGRESS = 0x02,   //升级/交换进度      (分区STAGE，fw_boot.c)
-  FW_KV_KEY_BOOT_SIZE     = 0x03,   //升级镜像大小       (分区STAGE，fw_boot.c)
-  FW_KV_KEY_BOOT_SCRATCH  = 0x04,   //擦写暂存的单页数据 (分区STAGE，fw_boot.c)
-  FW_KV_KEY_CALIB         = 0x05,   //标定/采样点数据    (分区EEPROM，calibration.c)
-  FW_KV_KEY_BAUD          = 0x06,   //通信波特率         (分区EEPROM，sys_param.c/bootloader)
+  FW_KV_KEY_BOOT_SCRATCH  = 0x03,   //擦写暂存的单页数据 (分区STAGE，fw_boot.c)
 }fw_kv_key_t;
 
 #endif

@@ -45,6 +45,8 @@
 #endif
 
 //进度节流用，仅升级进度打印需要
+/* 文件级静态、无锁：前提是进度打印只在单一上下文(升级流程)中调用。
+ * 若将来出现多个任务并行打印进度，需要改成按实例保存节流状态。 */
 #if FW_MSG_IS_ON(FW_MSG_EN_UPDATE)
   static uint32_t fw_msg_last_prog = 0xFFFFFFFFu;
 #endif
@@ -53,7 +55,7 @@
 
 #if FW_MSG_IS_ON(FW_MSG_EN_BANNER)
 /**
-* @brief  __DATE__("Mmm dd yyyy")转成"yyyy-mm-dd"
+* @brief  FW_BUILD_DATE("Mmm dd yyyy")转成"yyyy-mm-dd"
 * @param  out  输出缓冲区(至少11字节)
 * @param  cap  缓冲区大小
 * @note   手工解析，避免为一行banner拖进scanf库；格式不符则原样输出
@@ -62,14 +64,14 @@ static void fw_msg_build_date(char *out, uint32_t cap)
 {
   static const char *mon[12] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-  const char *date = __DATE__;   //固定"MMM DD YYYY"，个位日前面补空格
+  const char *date = FW_BUILD_DATE;   //固定"MMM DD YYYY"，个位日前面补空格
   int day;
   int year = 0;
   int idx = -1;
 
   if(date[3] != ' ' || date[6] != ' ')
   {
-    snprintf(out, cap, "%s", __DATE__);
+    snprintf(out, cap, "%s", FW_BUILD_DATE);
     return;
   }
   day = ((date[4] == ' ') ? 0 : (date[4] - '0') * 10) + (date[5] - '0');
@@ -77,7 +79,7 @@ static void fw_msg_build_date(char *out, uint32_t cap)
   {
     if(date[i] < '0' || date[i] > '9')
     {
-      snprintf(out, cap, "%s", __DATE__);
+      snprintf(out, cap, "%s", FW_BUILD_DATE);
       return;
     }
     year = year * 10 + (date[i] - '0');
@@ -92,7 +94,7 @@ static void fw_msg_build_date(char *out, uint32_t cap)
   }
   if(idx < 0)
   {
-    snprintf(out, cap, "%s", __DATE__);
+    snprintf(out, cap, "%s", FW_BUILD_DATE);
     return;
   }
   snprintf(out, cap, "%04d-%02d-%02d", year, idx + 1, day);
@@ -148,7 +150,14 @@ static const char *fw_msg_err_text(fw_msg_err_t err)
 * @return 分区名，未登记返回"?"
 * @note   分区名已改由fw_kv回调给出，本函数暂无调用者；仅在KV调试开关打开时编译
 */
-static const char *fw_msg_part_name(uint32_t base)
+/* 保留但当前无调用者：用属性抑制-Wunused-function，避免打开KV调试开关后
+ * 在-Werror环境下编译失败 */
+#if defined(__GNUC__) || defined(__clang__)
+  #define FW_MSG_UNUSED_FN  __attribute__((unused))
+#else
+  #define FW_MSG_UNUSED_FN
+#endif
+static const char *FW_MSG_UNUSED_FN fw_msg_part_name(uint32_t base)
 {
   for(uint32_t i = 0; i < fw_kv_part_count; i++)
   {
@@ -300,6 +309,11 @@ void fw_msg_update_progress(uint32_t page, uint32_t pages)
   {
     return;
   }
+  //调用方传超界页号时夹到总数，避免打印出"120%"这类越界百分比
+  if(page > pages)
+  {
+    page = pages;
+  }
   //page*100的回绕界限约4295万页，远超本库任何分区，直接使用乘法求百分比
   percent = (page * 100u) / pages;
   percent -= percent % FW_MSG_PROG_STEP;
@@ -446,7 +460,9 @@ void fw_msg_kv_parts(void)
   {
     const fw_kv_part_t *part = &fw_kv_part_table[i];
     fw_kv_stats_t st;
-    fw_kv_t kv;
+    /* KV实例放静态区：fw_kv_t约184字节，放栈上会明显抬高深栈场景的RAM峰值。
+     * 本函数只在单线程诊断期调用，不涉及重入 */
+    static fw_kv_t kv;
 
     if(fw_kv_init(&kv, part) != FW_KV_OK)
     {

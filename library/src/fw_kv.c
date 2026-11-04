@@ -6,7 +6,8 @@
 
 /* ==================== 日志回调 ==================== */
 //库里所有日志都经这个回调报出去，没有注册就什么都不做
-static fw_kv_log_fn_t fw_kv_log = NULL;
+//注册发生在主循环、读取可能发生在任意上下文，加volatile避免编译器把判空结果缓存进寄存器
+static volatile fw_kv_log_fn_t fw_kv_log = NULL;
 #define FW_KV_LOG(evt, kv, a, b, c)		do{ if(fw_kv_log != NULL) fw_kv_log((evt), (kv), (kv)->name, (a), (b), (c)); }while(0)
 
 /**
@@ -52,7 +53,16 @@ typedef struct
   uint32_t status;			//节点状态：VALID/DELETED
 }wl_node_hdr_t;
 
-//GC时暂存有效记录的缓冲区
+/* 结构体尺寸与字段偏移是分区二进制布局的一部分，换编译器/ABI或改字段后
+ * 必须在编译期暴露，否则要等上电扫描全盘CRC失败才发现 */
+FW_STATIC_ASSERT(sizeof(wl_sector_hdr_t) == 16, "wl_sector_hdr_t must be 16 bytes");
+FW_STATIC_ASSERT(sizeof(wl_node_hdr_t) == 16, "wl_node_hdr_t must be 16 bytes");
+FW_STATIC_ASSERT(offsetof(wl_node_hdr_t, status) == 12, "wl_node_hdr_t.status must be at offset 12");
+
+/* GC时暂存有效记录的缓冲区。
+ * 用文件级静态缓冲而不是实例成员，是为了不让每个KV实例都背上这块RAM开销。
+ * 多实例场景下安全的前提是GC全程在FW_KV_LOCK()保护内执行，同一时刻只会有一个
+ * 实例使用这块缓冲，因此不需要按实例隔离。 */
 static uint8_t gc_buf[FW_KV_GC_BUF_SIZE];
 
 /* 常驻key映射(key→最新记录位置)位于实例内(见fw_kv.h的fw_kv_t.key_map)：
@@ -219,19 +229,43 @@ static int fw_kv_sector_erase(fw_kv_t *kv, uint32_t index)
 */
 static int fw_kv_sector_is_erased(fw_kv_t *kv, uint32_t sec_index)
 {
-  uint32_t word = FW_ERASED_WORD;
+  uint8_t buf[64];//按块读，避免每个字都调一次后端read
   uint32_t addr = fw_kv_sector_addr(kv, sec_index);
+  uint32_t off = 0;
 
-  for(uint32_t off = 0; off < kv->sector_size; off += sizeof(uint32_t))
+  while(off < kv->sector_size)
   {
-    if(kv->ops.read(addr + off, (uint8_t *)&word, sizeof(word)) != 0)
+    uint32_t chunk = kv->sector_size - off;
+    uint32_t i = 0;
+
+    if(chunk > sizeof(buf))
+    {
+      chunk = sizeof(buf);
+    }
+    if(kv->ops.read(addr + off, buf, chunk) != 0)
     {
       return 0;//读失败：按"需要擦除"处理，最坏只是多擦一次
     }
-    if(word != FW_ERASED_WORD)
+    //按字比较；用memcpy取值，避免在只支持对齐访问的内核上出错
+    for(; (i + sizeof(uint32_t)) <= chunk; i += sizeof(uint32_t))
     {
-      return 0;
+      uint32_t word;
+
+      memcpy(&word, buf + i, sizeof(word));
+      if(word != FW_ERASED_WORD)
+      {
+        return 0;
+      }
     }
+    //块尾不足一个字时逐字节比较
+    for(; i < chunk; i++)
+    {
+      if(buf[i] != (uint8_t)FW_ERASED_WORD)
+      {
+        return 0;
+      }
+    }
+    off += chunk;
   }
   return 1;
 }
@@ -273,12 +307,22 @@ static int fw_kv_sector_write_hdr(fw_kv_t *kv, uint32_t index, uint32_t seq, uin
 * @param  offset     扇区内偏移
 * @param  hdr        输出节点头指针
 * @return 0成功，非0失败
+* @note   读入后立即校验长度字段上界。该字段取自Flash，损坏时可能接近UINT32_MAX，
+*         若放任其参与后续 rec_len 计算会加法回绕绕过边界检查，CRC校验也会按
+*         超长长度循环读取。
 */
 static int fw_kv_node_read_hdr(fw_kv_t *kv, uint32_t sec_index, uint32_t offset, wl_node_hdr_t *hdr)
 {
+  uint32_t overhead = sizeof(wl_sector_hdr_t) + sizeof(wl_node_hdr_t) + sizeof(uint32_t);
+
   if(kv->ops.read(fw_kv_sector_addr(kv, sec_index) + offset, (uint8_t *)hdr, sizeof(*hdr)) != 0)
   {
     return FW_KV_ERR_FLASH;
+  }
+  //value_len 不得超过单个扇区扣掉扇区头、节点头与CRC字段后的可用字节数
+  if((kv->sector_size <= overhead) || (hdr->value_len > (kv->sector_size - overhead)))
+  {
+    return FW_KV_ERR_CRC;//长度字段越界，按数据损坏处理
   }
   return FW_KV_OK;
 }
@@ -296,10 +340,17 @@ static int fw_kv_node_crc_ok(fw_kv_t *kv, uint32_t sec_index, uint32_t offset, c
 {
   uint32_t addr = fw_kv_sector_addr(kv, sec_index) + offset;
   uint32_t h = 0x811C9DC5u;//FNV-1a初始值
-  uint32_t left = hdr->value_len;
+  uint32_t overhead = sizeof(wl_sector_hdr_t) + sizeof(wl_node_hdr_t) + sizeof(uint32_t);
+  uint32_t left;
   uint32_t pos = sizeof(wl_node_hdr_t);
   uint32_t stored;
   uint8_t chunk[64];
+  //长度字段越界直接判校验失败，避免按超长长度循环读取
+  if((kv->sector_size <= overhead) || (hdr->value_len > (kv->sector_size - overhead)))
+  {
+    return 0;
+  }
+  left = hdr->value_len;
   /* 跳过magic，校验key/value_len/status共12字节 */
   h = fw_kv_fnv1a_update(h, (const uint8_t *)hdr + sizeof(hdr->magic), sizeof(hdr->key) + sizeof(hdr->value_len) + sizeof(hdr->status));
   //校验value
@@ -610,8 +661,8 @@ static uint32_t fw_kv_sector_stats(fw_kv_t *kv, uint32_t sec_index, uint32_t sec
 * @return 1=空扇区，0=非空
 * @note   两种都算空扇区：
 *         1) 扇区头无效(已擦除，从未写过或擦除后掉电)
-*         2) 扇区头有效但一条记录都没有(GC结束时会给刚擦除的原扇区
-*            立刻补写带擦除次数的头，用来保住擦除次数统计)
+*         2) 扇区头有效但一条记录都没有(GC擦除原扇区后不补写头，重上电
+*            扫描时若该扇区已有有效头，则依据"无记录"判定为空扇区)
 */
 static int fw_kv_sector_is_spare(fw_kv_t *kv, uint32_t sec_index)
 {
@@ -750,12 +801,14 @@ static int fw_kv_gc_pick_donor(fw_kv_t *kv, int exclude, int fast_path)
 * @param  sec_index  扇区索引
 * @param  sec_seq    扇区序号
 * @param  fast_path  1=key映射快速路径
-* @param  staged     输入输出：缓冲区中已暂存的字节数
+* @param  staged     输入输出：已暂存(或已统计)的字节数
+* @param  buf        数据暂存缓冲区；传NULL时只累计存活字节数，不拷贝数据
+* @param  cap        buf 的字节容量
 * @return 0成功，非0失败
 * @note   扫描规则与读取路径一致；暂存区不足时返回FW_KV_ERR_NOSPC
 */
 static int fw_kv_gc_stage_sector(fw_kv_t *kv, uint32_t sec_index, uint32_t sec_seq,
-              int fast_path, uint32_t *staged)
+              int fast_path, uint32_t *staged, uint8_t *buf, uint32_t cap)
 {
   uint32_t offset = sizeof(wl_sector_hdr_t);
   uint32_t end = kv->sector_size;
@@ -790,13 +843,17 @@ static int fw_kv_gc_stage_sector(fw_kv_t *kv, uint32_t sec_index, uint32_t sec_s
 
     if(keep)
     {
-      if(*staged + rec_len > sizeof(gc_buf))
+      if(buf != NULL)
       {
-        return FW_KV_ERR_NOSPC;//暂存区装不下，调用方需回退到其它GC策略
-      }
-      if(kv->ops.read(fw_kv_sector_addr(kv, sec_index) + offset, gc_buf + *staged, rec_len) != 0)
-      {
-        return FW_KV_ERR_FLASH;
+        //用减法比较，避免 *staged + rec_len 回绕后误判为装得下
+        if((*staged > cap) || (rec_len > (cap - *staged)))
+        {
+          return FW_KV_ERR_NOSPC;//暂存区装不下，调用方需回退到其它GC策略
+        }
+        if(kv->ops.read(fw_kv_sector_addr(kv, sec_index) + offset, buf + *staged, rec_len) != 0)
+        {
+          return FW_KV_ERR_FLASH;
+        }
       }
       *staged += rec_len;
     }
@@ -885,44 +942,23 @@ static int fw_kv_gc_stream_sector(fw_kv_t *kv, uint32_t src, uint32_t src_seq, i
 }
 
 /**
-* @brief  回读校验搬迁目标扇区中写入的存活记录
-* @param  kv         KV实例指针
-* @param  sec_index  目标扇区索引
-* @param  staged     已写入的字节数
-* @return 0成功，非0失败
-* @note   逐条CRC校验，确认搬迁数据完整后才允许擦除原扇区
-*/
-static int fw_kv_gc_verify_records(fw_kv_t *kv, uint32_t sec_index, uint32_t staged)
-{
-  uint32_t offset = sizeof(wl_sector_hdr_t);
-  uint32_t end = sizeof(wl_sector_hdr_t) + staged;
-
-  while(offset < end)
-  {
-    wl_node_hdr_t hdr;
-    uint32_t rec_len;
-
-    if(fw_kv_node_read_hdr(kv, sec_index, offset, &hdr) != FW_KV_OK) return FW_KV_ERR_FLASH;
-    if(hdr.magic != FW_KV_NODE_MAGIC) return FW_KV_ERR_FLASH;
-    rec_len = sizeof(wl_node_hdr_t) + hdr.value_len + sizeof(uint32_t);
-    if(offset + rec_len > end) return FW_KV_ERR_FLASH;
-    if(!fw_kv_node_crc_ok(kv, sec_index, offset, &hdr)) return FW_KV_ERR_FLASH;
-    offset += rec_len;
-  }
-  return (offset == end) ? FW_KV_OK : FW_KV_ERR_FLASH;
-}
-
-/**
 * @brief  GC：回收一个扇区，腾出可继续追加的空间
 * @param  kv  KV实例指针
 * @return 0成功，非0失败
-* @note   掉电安全策略：先把待回收扇区(victim)中仍有效的记录写入另一个扇区
-*         (dest)并逐条回读校验，确认无误后才擦除victim。任一步骤掉电，
-*         victim都保持完整，不会丢数据。
+* @note   掉电安全策略：先把待回收扇区(victim)中仍有效的记录逐条写入另一个空
+*         扇区(dest)，每条写完立即回读校验，确认无误后才擦除victim。任一步骤
+*         掉电，victim都保持完整，不会丢数据。
 *         为保证始终存在备用扇区，扇区轮转时预留至少一个空扇区
-*         (见fw_kv_sector_activate_next)；只有当分区内一个空扇区都没有时(例如从
-*         旧固件升级上来)，才退化为把两个扇区的存活数据压缩进一个扇区
-*         腾出空扇区。
+*         (见fw_kv_sector_activate_next)；分区内一个空扇区都没有时(例如从旧
+*         固件升级上来)，只在victim已无存活记录的情况下擦除它腾出空扇区，
+*         需要合并两个有效扇区的场景直接上报空间不足，不采用先擦有效扇区
+*         再写回这种掉电即丢数据的做法。
+* @note   本函数由持有FW_KV_LOCK()的调用方进入，整个GC过程都在临界区内完成。
+*         扇区擦除与逐条写回耗时可达数十至数百毫秒，因此：
+*         1) 不在这里输出任何阻塞式日志——FW_KV_LOG回调在临界区内触发，注册的
+*            日志实现必须保证非阻塞(只做入队或直接丢弃)，否则会显著拉长临界区；
+*         2) 使用独立看门狗的调用方，需要在进入KV接口前按最坏GC耗时预留喂狗
+*            窗口，或使用能在中断/低优先级任务里喂狗的看门狗配置。
 */
 static int fw_kv_gc_collect(fw_kv_t *kv)
 {
@@ -963,45 +999,29 @@ static int fw_kv_gc_collect(fw_kv_t *kv)
 
   if(donor_path)
   {
-    /* ---- 回退路径：目标扇区自己还存着有效数据，必须先把两边数据都搬到RAM ---- */
-    uint32_t staged = 0;
-    wl_sector_hdr_t sh;
+    /* ---- 回退路径：分区内一个空扇区都没有，只能从有效扇区里硬腾一个出来 ----
+     * 掉电安全约束：把 dest 与 victim 的存活数据合并进 dest，必须先擦除 dest 才能
+     * 重新写入，擦除到写回完成之间掉电会永久丢失 dest 原有的存活记录。因此这里
+     * 只在 victim 不含存活记录时执行(此时擦除 victim 即可腾出空扇区)，其余情况
+     * 如实上报空间不足，不打开这个丢数据窗口。 */
+    uint32_t victim_live = 0;
 
-    if(fw_kv_sector_read_hdr(kv, (uint32_t)dest, &sh) == FW_KV_OK && fw_kv_sector_is_valid(&sh))
-    {
-      if(fw_kv_gc_stage_sector(kv, (uint32_t)dest, sh.seq, fast_path, &staged) != FW_KV_OK)
-      {
-        return FW_KV_ERR_NOSPC;
-      }
-    }
-    if(fw_kv_gc_stage_sector(kv, (uint32_t)victim, victim_seq, fast_path, &staged) != FW_KV_OK)
+    if(fw_kv_gc_stage_sector(kv, (uint32_t)victim, victim_seq, fast_path, &victim_live, NULL, 0U) != FW_KV_OK)
     {
       return FW_KV_ERR_NOSPC;
     }
-    if(sizeof(wl_sector_hdr_t) + staged > kv->sector_size)
+    if(victim_live > 0U)
     {
-      return FW_KV_ERR_NOSPC;//存活数据装不进一个扇区
+      return FW_KV_ERR_NOSPC;//victim 仍有存活记录，合并前必须先擦除有效扇区，放弃本次回收
     }
-    if(fw_kv_sector_erase(kv, (uint32_t)dest) != FW_KV_OK)
-    {
-      return FW_KV_ERR_FLASH;
-    }
-    if(fw_kv_sector_write_hdr(kv, (uint32_t)dest, new_seq, FW_KV_SECTOR_ACTIVE) != FW_KV_OK)
+    if(fw_kv_sector_erase(kv, (uint32_t)victim) != FW_KV_OK)
     {
       return FW_KV_ERR_FLASH;
     }
-    if(staged > 0)
-    {
-      if(kv->ops.write(fw_kv_sector_addr(kv, (uint32_t)dest) + sizeof(wl_sector_hdr_t), gc_buf, staged) != 0)
-      {
-        return FW_KV_ERR_FLASH;
-      }
-      if(fw_kv_gc_verify_records(kv, (uint32_t)dest, staged) != FW_KV_OK)
-      {
-        return FW_KV_ERR_FLASH;
-      }
-    }
-    dest_used = sizeof(wl_sector_hdr_t) + staged;
+    FW_KV_LOG(FW_KV_EVT_GC, kv, victim, dest, 0);
+    //回收后按现有记录重建常驻映射
+    fw_kv_key_map_build(kv);
+    return FW_KV_OK;//活动扇区与已用字节数均不变，只是多出一个空扇区
   }
   else
   {
@@ -1236,6 +1256,8 @@ int fw_kv_init(fw_kv_t *kv, const fw_kv_part_t *part)
     return FW_KV_ERR_PARAM;//扇区大小必须是页大小的整数倍
   }
   //初始化实例字段(同时保存分区名，供日志回调使用)
+  //从这里开始读写实例状态，先获取锁，避免与另一任务对本实例的读写并发
+  FW_KV_LOCK();
   kv->ops = *part->ops;
   kv->name = (part->name != NULL) ? part->name : "?";
   kv->base = part->base;
@@ -1250,6 +1272,7 @@ int fw_kv_init(fw_kv_t *kv, const fw_kv_part_t *part)
   kv->key_map_ok = 1;
   if(kv->sector_count < 2U || kv->sector_count > FW_KV_MAX_SECTORS)
   {
+    FW_KV_UNLOCK();
     return FW_KV_ERR_PARAM;//至少需要2个扇区才能实现磨损均衡
   }
   /* 以下为配置检查通过后的内部不变量，后续扇区号换算均依赖它们 */
@@ -1284,6 +1307,7 @@ int fw_kv_init(fw_kv_t *kv, const fw_kv_part_t *part)
   }
   //建立常驻key映射：get与统计均依赖它，无需每次扫描全分区
   fw_kv_key_map_build(kv);
+  FW_KV_UNLOCK();
   return FW_KV_OK;
 }
 
@@ -1417,6 +1441,14 @@ static int fw_kv_get_impl(fw_kv_t *kv, uint32_t key, uint8_t *value, uint32_t *l
     }
   }
 
+  //读入后做完整性校验，避免把半写入或被改动的记录当成有效数据交给上层
+  if(!fw_kv_node_crc_ok(kv, sec, offset, &hdr))
+  {
+    FW_KV_LOG(FW_KV_EVT_ERROR, kv, FW_KV_ERR_CRC, 0, 0);
+    *len = 0;
+    return FW_KV_ERR_CRC;
+  }
+
   *len = hdr.value_len;
   return FW_KV_OK;
 }
@@ -1477,11 +1509,12 @@ static int fw_kv_set_impl(fw_kv_t *kv, uint32_t key, const uint8_t *value, uint3
     return FW_KV_ERR_PARAM;
   }
 
-  rec_len = sizeof(wl_node_hdr_t) + len + sizeof(uint32_t);
-  if(rec_len > kv->sector_size - sizeof(wl_sector_hdr_t))
+  //先按单扇区容量校验 len 上界，再做加法：否则 len 接近 UINT32_MAX 时 rec_len 会回绕绕过边界检查
+  if(len > (kv->sector_size - sizeof(wl_sector_hdr_t) - sizeof(wl_node_hdr_t) - sizeof(uint32_t)))
   {
     return FW_KV_ERR_NOSPC;  //记录太大，单个扇区放不下
   }
+  rec_len = sizeof(wl_node_hdr_t) + len + sizeof(uint32_t);
 
   if(fw_kv_ensure_space(kv, rec_len) != FW_KV_OK)
   {
@@ -1528,7 +1561,9 @@ static int fw_kv_del_impl(fw_kv_t *kv, uint32_t key)
 
   /* 删除通过追加一个DELETED墓碑记录实现 */
   rec_len = sizeof(wl_node_hdr_t) + sizeof(uint32_t);
-  if(rec_len > kv->sector_size - sizeof(wl_sector_hdr_t))
+  /*先判扇区容量大于扇区头，再按减法比较长度，避免 sector_size 过小时下溢*/
+  if((kv->sector_size <= sizeof(wl_sector_hdr_t)) ||
+     (rec_len > (kv->sector_size - sizeof(wl_sector_hdr_t))))
   {
     return FW_KV_ERR_NOSPC;
   }
@@ -1591,6 +1626,9 @@ int fw_kv_del(fw_kv_t *kv, uint32_t key)
 * @param  kv     KV实例指针
 * @param  stats  统计信息输出指针
 * @return 0成功，非0失败
+* @note   统计需要在锁内扫两遍分区(先建key映射判断记录新旧，再累计各扇区的
+*         有效与垃圾字节数)，耗时随分区容量线性增长，最大可达一次完整分区扫描。
+*         这是诊断接口，不要放进周期性任务或中断相关的实时路径。
 */
 int fw_kv_get_stats(fw_kv_t *kv, fw_kv_stats_t *stats)
 {

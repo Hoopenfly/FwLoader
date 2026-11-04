@@ -13,15 +13,6 @@
 //更换模式前须先擦除两个Slot；旧模式残留的有效镜像会导致地址错乱
 //XIP模式适合支持双Bank的芯片；不支持双Bank时，要把两份固件编译到不同的IROM地址
 #define FW_BOOT_UPGRADE_MODE   0
-/* BootLoader内置的串口固件升级(IAP)开关：
- *   1 = 启用：两个槽位都没有有效镜像时，BootLoader停在串口升级模式，
- *       等待上位机发送固件(文本$UP或HEX 0x55AA协议，与App是同一套)
- *   0 = 关闭：无有效镜像时只停在提示循环，需要SWD重新烧录
- * 说明：App构建本来就带IAP，这个宏只影响BootLoader构建。
- */
-#ifndef FW_BOOT_IAP_ENABLE
-  #define FW_BOOT_IAP_ENABLE					1
-#endif
 #define VTOR_ALIGN_MASK								0x7F  //VTOR 128字节对齐掩码
 //暂存区KV分区名：升级标志、进度、镜像大小、交换暂存都存在这里
 //用到的键(FW_KV_KEY_BOOT_*)统一在fw_cfg.h的键值表里定义
@@ -55,10 +46,8 @@ int fw_boot_image_is_valid(uint32_t addr);
 #if (FW_BOOT_BUILD_LOADER == 0)
 void fw_boot_handler(void);
 
-#if (FW_BOOT_IAP_ENABLE != 0)
 //没有可跳转的镜像时，fw_boot_handler会返回，之后由它接管串口升级
 void fw_boot_iap_poll(void);
-#endif
 void fw_boot_jump_to_app(uint32_t app_addr);
 #endif
 
@@ -70,13 +59,13 @@ uint32_t fw_boot_flag_read(void);
 int fw_boot_flag_write(uint32_t flag);
 uint32_t fw_boot_progress_read(void);
 int fw_boot_progress_write(uint32_t value);
-uint32_t fw_boot_image_size_read(void);
-int fw_boot_image_size_write(uint32_t size);
 
 //XIP槽位查询
 #if (FW_BOOT_UPGRADE_MODE == 2)
 uint32_t fw_xip_get_run_slot(void);
+#if (FW_BOOT_BUILD_LOADER == 0)
 uint32_t fw_xip_is_pending_confirm(void);
+#endif
 #endif
 
 #endif /* _BOOT_H_ */

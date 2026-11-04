@@ -4,7 +4,7 @@
 
 嵌入式固件升级库（目前仅在 STM32L071CZT6 实机验证过）。
 
-**库版本：v1.0.0**。同一版本号维护在 `library/inc/fw_msg.h` 的 `FW_LIB_VERSION`，发布时以本仓库的 Git tag 为准。
+**库版本：v2.0.0**。同一版本号维护在 `library/inc/fw_msg.h` 的 `FW_LIB_VERSION`，发布时以本仓库的 Git tag 为准。
 
 - 支持三种编译期选定的升级方式：覆写、交换、就地执行。组织方式参考 MCUboot，三种方式各占一个源文件，主流程只有一条，不做语句级分叉。
 - 升级过程中需要持久化的数据（升级标志、交换进度、单页暂存）由库内的扇区级磨损均衡 KV（`fw_kv`）承载。这些数据在升级期间会被反复改写，且随时可能掉电，因此 `fw_kv` 采用追加式写入与先搬后擦的 GC，底层读写擦由调用方注入。
@@ -30,6 +30,8 @@ FwLoader/                              仓库根
             fw_port.h                  平台适配层接口
             fw_msg.h                   对外日志
             fw_assert.h                库内断言
+            fw_img.h                   镜像元数据：结构、解析、定位、水印、版本校验
+            fw_delta.h                 差分记录流解码器：COPY/LITERAL/DIFF
         src/                           源文件
             fw_kv.c                    KV 存储内核
             fw_boot.c                  引导主流程、KV 元数据读写、镜像校验、跳转
@@ -40,12 +42,18 @@ FwLoader/                              仓库根
             fw_port.c                  平台适配层实现
             fw_msg.c                   对外日志实现
             fw_cfg.c                   分区表实例化
-    产线烧录工具/                       PC 端串口烧录工具，不属于库本身，见第十二节
-        fw_download.ps1                烧录脚本
-        烧录.bat                       批处理入口
-        app.bin                        固件占位文件
-        工具说明.md                    工具设计与协议说明
-        使用说明.md                    操作说明
+            fw_img.c                   镜像元数据实现
+            fw_delta.c                 差分记录流解码器实现(仅App构建引用)
+    mkimg/                             发布打包工具，不属于库本身，见第十二节
+        mkimg.c                        打包工具源码，只用C标准库，追加镜像元数据生成发布包
+        mkimg.exe                      Windows编译产物，供Keil After Build直接调用
+    fwdelta/                      上位机差分生成工具，不属于库本身，见第十四节
+        fw_delta/                       Qt 工程与界面
+            fw_delta.pro                qmake 工程
+            core/                       差分算法与镜像元数据，纯 C++，不依赖 Qt
+            transport/                  传输接口、串口实现、HEX协议上传器
+            res/                        应用图标与 qrc
+        bin/                            构建产物
 ```
 
 全部配置集中在 `library/inc/fw_cfg.h`（库内核参数 / 器件能力 / 板级布局三节）；平台实现（Flash与EEPROM读写擦、串口收发与取帧、调试输出、中断开关、跳转、复位原因、断言动作、临界区）放在 `library/src/fw_port.c`；库内其它文件不使用平台头文件与寄存器，只调用 `fw_port` 的抽象接口。平台后端与使用方工具不属于本库，由工程提供。
@@ -95,11 +103,10 @@ FwLoader/                              仓库根
 |---|---|---|---|
 | `FW_KV_KEY_BOOT_FLAG` | 1 | STAGE | 升级信令标志 |
 | `FW_KV_KEY_BOOT_PROGRESS` | 2 | STAGE | 交换进度 / XIP 运行槽位 |
-| `FW_KV_KEY_BOOT_SIZE` | 3 | STAGE | 固件实际大小，交换模式据此只交换有效页 |
-| `FW_KV_KEY_BOOT_SCRATCH` | 4 | STAGE | 交换模式的单页暂存 |
-| `FW_KV_KEY_CALIB` | 5 | EEPROM | 标定 / 传感器参数 |
-| `FW_KV_KEY_BAUD` | 6 | EEPROM | 通信波特率 |
+| `FW_KV_KEY_BOOT_SCRATCH` | 3 | STAGE | 交换模式的单页暂存 |
 | 应用自定义键 | 由使用方编号 | 应用分区 | 与同分区内其它键不重复即可 |
+
+库只定义升级流程自身用到的键（`fw_boot.c` 的三个）。镜像大小与版本都取自镜像元数据（`image_len` / `image_ver`），不在 KV 里另存；版本比较的下限是设备当前运行的镜像。业务键属于应用层，由使用方在自己的头文件里按分区编号。
 
 ### 1.4 API
 
@@ -189,15 +196,17 @@ fw_kv_set(&kv, FW_KV_KEY_BOOT_FLAG, (const uint8_t *)&flag, sizeof(flag));
 
 | 模式 | 文件 | 做法 | 回滚 |
 |---|---|---|---|
-| `0` 覆写 | `library/src/fw_overwrite.c` | 新镜像先收到 SLOT1，启动时整份覆写到 SLOT0，倒序写入 | 不支持 |
+| `0` 覆写 | `library/src/fw_overwrite.c` | 新镜像先收到 SLOT1，启动时整份覆写到 SLOT0，按页顺序写入 | 不支持 |
 | `1` 交换 | `library/src/fw_swap.c` | SLOT0 与 SLOT1 逐页交换，用 STAGE 的 KV 做单页暂存与进度记录；**交换页数按镜像实际大小计算**，不必处理整个槽位 | 支持 |
 | `2` 就地执行 | `library/src/fw_xip.c` | 两个槽位各自就地执行，只切换运行槽位与 confirm 位 | 支持 |
 
-**覆写采用倒序写入**：从最后一页向第一页写，使向量表所在页最后落盘。中途断电时向量表仍为擦除态，`fw_boot_image_is_valid()` 判定无效，不会跳转到写了一半的镜像。配合 `CONFIRMED` 仅在覆写成功后写入，标志仍为 `VALID`，重启后重新执行升级。覆写始终覆写整个槽位，页数恒为槽位大小除以页大小（本工程 512 页），耗时只与槽位大小和器件编程速度有关，与实际镜像大小无关。
+**覆写按页顺序写入**：从第 0 页写到最后一页。覆写页数按镜像元数据里的 `image_len` 计算（向上取整到页），只搬镜像实际占用的大小，镜像之外的页不动；耗时与镜像大小和器件编程速度成正比，元数据缺失时退回按整槽计算。中途断电时标志仍是 `VALID`，重启后重新执行覆写；中途写失败时由跳转前的完整校验兜底，见下一条。
+
+**跳转前做完整校验**：`fw_strategy_select_and_jump()` 在跳转 SLOT0 前调用 `fw_img_verify_full()`，它先从槽位里定位镜像元数据、核对项目水印，再把代码区从 Flash 分块读回、重新累加 CRC32，与元数据里的 `code_crc32` 比对。向量表有效但内容不完整（覆写中途中断、写入出错、Flash 内容损坏）的镜像在这里被判为无效，按 SLOT0 无效处理，转由 SLOT1 的恢复路径重搬。代价是每次启动多读一遍代码区，用时与镜像大小、器件读取速度和 Flash 读取带宽成正比。
 
 进度输出按已完成页数驱动、每 10% 打印一档，与写入顺序无关：模式 0 与模式 1 传的都是已完成页数（1..总页数），最后一档为 100%。模式 2 只切换运行槽位、不搬移镜像，因此不输出升级动作行。
 
-每个策略文件由文件级 `#if` 包住，并要求 `FW_BOOT_BUILD_LOADER == 0`，一次构建只会编到其中一个；例外是模式 2 的两个槽位查询函数在 App 构建也需要编译，见 `library/src/fw_xip.c` 顶部条件。
+每个策略文件由文件级 `#if` 包住，并要求 `FW_BOOT_BUILD_LOADER == 0`，一次构建只会编到其中一个；例外是模式 2 的 `fw_xip_get_run_slot()` 在 App 构建也要编，因为 `fw_boot_set_confirmed()` 与差分路径都要读当前运行槽位，见 `library/src/fw_xip.c` 顶部条件。`fw_xip_is_pending_confirm()` 只有引导侧使用，编进引导构建。
 
 ### 2.3 启动流程
 
@@ -217,16 +226,13 @@ fw_strategy_select_and_jump();       //阶段4：选择有效镜像跳转
 
 fw_msg_error(FW_MSG_ERR_NO_IMAGE, 0);   //阶段5：两个槽位都没有有效镜像
 fw_boot_flag_write(FW_BOOT_FLAG_NONE);
-#if (FW_BOOT_IAP_ENABLE != 0)
-  fw_port_rx_irq_enable();           //重新打开接收中断后返回，串口升级交给主循环
-#endif
-//两种情况都返回；无 IAP 时的周期提示由 main() 的 while(1) 负责，见 13.1
+fw_port_rx_irq_enable();           //重新打开接收中断后返回，串口升级交给主循环
+//返回后由 main() 的 while(1) 周期调用 fw_boot_iap_poll()，见 13.1
 ```
 
-阶段 5 的两种行为：
+阶段 5 的行为：
 
-- `FW_BOOT_IAP_ENABLE = 1`：停在串口升级模式等待上位机发送固件，收到完整固件后提交并输出提示，设备自身不复位，复位由现场完成（见 2.9），详见 [2.9](#29-无有效镜像时的串口升级fw_boot_iap_enable)。
-- `FW_BOOT_IAP_ENABLE = 0`：同样直接返回，由 `main()` 的循环周期调用 `fw_msg_waiting()`，此时只能通过调试器重新烧录。
+- 停在串口升级模式等待上位机发送固件，收到完整固件后提交并输出提示，设备自身不复位，复位由现场完成，详见 [2.9](#29-无有效镜像时的串口升级)。
 
 BootLoader 侧显式调用 `fw_boot_stage_init()`，目的是尽早发现初始化失败并停在错误状态。App 侧不需要调用，见 [2.8](#28-暂存区-kv-的惰性初始化)。
 
@@ -267,11 +273,13 @@ BootLoader 侧显式调用 `fw_boot_stage_init()`，目的是尽早发现初始�
 
 ### 2.6 镜像有效性判定
 
-`fw_boot_image_is_valid(addr)` 检查 Cortex-M 向量表，三个条件全部满足才判定有效：
+`fw_boot_image_is_valid(addr)` 检查 Cortex-M 向量表，三个条件全部满足才判定镜像有效：
 
 - 地址在 Flash 范围内；
 - 向量表第 0 项，即初始 MSP，落在 RAM 范围内；
 - 向量表第 1 项，即复位向量，落在 Flash 范围内。
+
+镜像刚写入、还不完整时也能判，用于 IAP 首帧落盘后和跳转前的快速判断；镜像元数据与代码 CRC32 的完整校验在 IAP 阶段完成。
 
 向量表地址需按 `VTOR_ALIGN_MASK` 对齐，但该对齐不在本判定内校验，而在跳转时校验：不满足则输出 `Err 0x05`、把标志清为 `NONE` 并停机。
 
@@ -280,7 +288,7 @@ BootLoader 侧显式调用 `fw_boot_stage_init()`，目的是尽早发现初始�
 ```c
 int         fw_boot_stage_init(void);        //初始化STAGE分区的KV，可显式调用；不调用也会自动初始化
 void        fw_boot_set_confirmed(void);     //App确认本轮升级有效
-int         fw_boot_image_is_valid(uint32_t addr);
+int         fw_boot_image_is_valid(uint32_t addr);   //只判向量表，跳转与搬运前用
 
 //以下仅引导构建参与编译
 void fw_boot_handler(void);
@@ -314,9 +322,9 @@ uint32_t fw_xip_is_pending_confirm(void);
 
 设计目的：新增模块读写升级标志时若未先初始化，仍会走正常初始化路径，不会读写一个未初始化的实例。
 
-### 2.9 无有效镜像时的串口升级（`FW_BOOT_IAP_ENABLE`）
+### 2.9 无有效镜像时的串口升级
 
-两个槽位都没有有效镜像时，引导程序没有可跳转的目标。`FW_BOOT_IAP_ENABLE = 1` 时它不进入提示循环，而是成为升级接收端：
+两个槽位都没有有效镜像时，引导程序没有可跳转的目标。此时它不进入提示循环，而是成为升级接收端：
 
 ```
 阶段5
@@ -328,7 +336,7 @@ uint32_t fw_xip_is_pending_confirm(void);
   │           输出 Serial update: firmware received, reset to upgrade
   │           无法识别的帧 → 忽略，不作应答
   └─ 复位由现场断电或复位键完成，设备自身不复位
-        → 复位后执行正常流程：阶段2 覆写 SLOT1 到 SLOT0，倒序写入，然后跳转新固件
+        → 复位后执行正常流程：阶段2 覆写 SLOT1 到 SLOT0（按页顺序写入），随后做完整校验，通过才跳转新固件
 ```
 
 提交后不自动复位，也不接受复位命令。原因：设备一旦复位，上位机持有的串口句柄不再收到数据，后续覆写进度与启动信息全部丢失。因此 BootLoader 收完固件后只输出提示，不执行复位动作，复位由现场完成。
@@ -342,42 +350,36 @@ uint32_t fw_xip_is_pending_confirm(void);
 - 固件写入哪个槽位由升级模式决定：模式 0/1 固定写入 SLOT1，模式 2（XIP）写入当前运行槽位的对侧槽位，与 App 侧升级使用同一套协议；
 - 判断帧边界需要空闲中断：一帧最长 324 字节，收齐需要 20ms 以上，边收边取会把半帧当作整帧解析，导致后续字节错位。引导构建用平台后端的空闲中断事件接口按帧取数据，见 `library/src/fw_port.c` 的 `fw_port_read_frame()`；App 构建改由中断通知接收任务；
 - 等待期间不做周期输出，避免与 IAP 应答帧抢占串口，干扰上位机解析；
-- 该宏只影响引导构建，App 构建始终包含 IAP；
 - 轮询函数为 `library/src/fw_boot.c` 的 `fw_boot_iap_poll()`，由主循环调用。它只调用 `library/src/fw_port.c` 提供的取帧与发送抽象动作，不直接访问串口寄存器。
 
 ---
 
 ## 三、串口升级：`iap`
 
-`library/src/fw_iap.c` 与 `library/inc/fw_iap.h` 整体由 `#if (FW_BOOT_BUILD_LOADER == 1) || (FW_BOOT_IAP_ENABLE != 0)` 包住：App 构建始终编译；引导构建由 `FW_BOOT_IAP_ENABLE` 决定，用于两个槽位都无效时接收固件，见 [2.9](#29-无有效镜像时的串口升级fw_boot_iap_enable)。
+`library/src/fw_iap.c` 与 `library/inc/fw_iap.h` 在两种构建里都参与编译：应用构建用它接收固件，引导构建用它兜底接收固件（见 [2.9](#29-无有效镜像时的串口升级)）。
 
-支持两套上位机协议，由接入层按帧头分发：
+只支持一套 HEX 二进制协议，接入层按帧头 `0x55 0xAA` 分发：
 
 | 协议 | 帧头 | 特点 |
 |---|---|---|
-| 文本 `$UP` | `$UP` / `$UD` | 24 字节文本帧头加数据，数据部分每帧不超过 300 字节（整帧最长 324 字节），带整包 CRC16 |
-| HEX 二进制 | `0x55 0xAA` | `SOF(2) VER_TYPE(1) OFFSET(4) LEN(2) DATA CRC16(2)`，每帧数据不超过 256 字节 |
+| HEX 二进制 | `0x55 0xAA` | `SOF(2) VER_TYPE(1) OFFSET(4) LEN(2) DATA CRC16(2)`，多字节字段小端，每帧数据不超过 256 字节 |
+
+帧类型：START(`0x00`)、DATA(`0x01`)、RESP(`0x02`)、START_DELTA(`0x03`)。
 
 接口：
 
 ```c
-void fw_iap_parse_text_frame(uint8_t *frame, uint32_t len);   //文本：整帧输入
 void fw_iap_parse_hex_frame(uint8_t *buf, uint32_t len);      //HEX：字节流就地解析
 iap_state_t fw_iap_get_status(uint32_t *total_size, uint32_t *received_size, uint8_t *percent);
 ```
 
-接收链路：接入层在串口空闲中断置位后取走整帧，按帧头识别协议，再调用上面两个解析函数之一。
+接收链路：接入层在串口空闲中断置位后取走整帧，调用 `fw_iap_parse_hex_frame()` 就地解析。
 
-固件写入哪个槽位由升级模式决定：模式 0/1 写入 SLOT1，模式 2（XIP）写入当前运行槽位的对侧槽位；整包校验通过后调用 `fw_boot_flag_write(FW_BOOT_FLAG_VALID)` 提交，实际升级由复位后的引导程序完成。
-
-会话规则如下。两套协议共用同一份会话状态结构，其中 OFFSET 衔接校验与重传判定只由 HEX 协议实现；文本 `$UP` 协议不校验 OFFSET 衔接，靠应答里的已收长度与英文提示让上位机自行重传：
-
-- 数据帧的 OFFSET 必须与已写入长度严格衔接，不衔接时返回 NAK 并携带期望位置，以此拒绝丢帧、乱序与粘帧；
-- 数据帧的帧尾恰好落在写入前沿时判为重传，仅重发 ACK；
-- 结束帧在会话已结束后重复到达时返回幂等 ACK；
-- 写入失败、整包 CRC 不符或镜像头无效时作废本次会话，要求上位机从偏移 0 整包重传；文本协议只在镜像超长与镜像头无效时作废会话，写入失败时保留会话状态，由上位机重发该帧；
-- 版本号不符的帧返回状态码为 `BAD_FRAME` 的 NAK；
-- 长度字段超过单帧上限的帧由解析层丢弃并重新查找 SOF，不返回 NAK；上位机不应发送的 ACK/NAK 帧直接忽略。
+- START：DATA 为 64 字节镜像元数据，设备算出 `code_len = image_len - 64`；
+- DATA：整包时 OFFSET 是代码偏移，差分时是差分流偏移；必须与已收长度严格衔接，帧尾恰好落在已收长度处判为重传，只回 RESP；
+- START_DELTA：DATA = 镜像元数据(64) + `base_crc32`(4) + `delta_len`(4)，设备先比对旧镜像元数据里登记的代码 CRC32 校验基版本；
+- 收满 `code_len`（整包）或 `delta_len`（差分）后自动校验、写镜像元数据、提交，没有结束帧；
+- 任何一步失败都作废会话，要求上位机从 START 重来。
 
 ---
 
@@ -387,10 +389,10 @@ iap_state_t fw_iap_get_status(uint32_t *total_size, uint32_t *received_size, uin
 - 前缀 `[APP] ` 与 `[BL]  `（引导前缀补两个空格，凑齐 6 字符宽）由 `FW_BOOT_BUILD_LOADER` 决定，两种构建共用同一份实现；
 - 输出为全 ASCII，行格式为 `<前缀><键=值 ...>`，便于上位机抓取；
 - 每一项有独立开关，`FW_MSG_ENABLE=0` 时全部关闭，函数体与字符串都不参与编译，调用方无需条件编译；
-- **输出经平台层**：`library/src/fw_msg.c` 调用 `fw_port_log_printf()`，不直接调用平台调试输出函数。单行上限为 `FW_PORT_LOG_LINE_MAX`，默认 64 字节，含行尾 `\r\n`；超长由平台层截断，并在截断处补 `\r\n`，保证上位机按行切分；
+- **输出经平台层**：`library/src/fw_msg.c` 调用 `fw_port_log_printf()`，不直接调用平台调试输出函数。日志最终从哪个物理通道输出（UART、USB、ITM、RTT 等）以及该通道如何初始化，完全由 `fw_port_log_printf()` 的平台实现决定，库不假定也不提供默认实现。单行上限为 `FW_PORT_LOG_LINE_MAX`，默认 64 字节，含行尾 `\r\n`；超长由平台层截断，并在截断处补 `\r\n`，保证上位机按行切分；
 - **复位原因只取一次**：`fw_msg_reset_reason()` 缓存 `fw_port_reset_reason_get()` 的结果，平台层读取后清标志的副作用仅发生一次，重复输出不会变为 `UNKNOWN`；
 - **擦写期间只做非阻塞输出**：KV 的 GC、轮转与错误事件可能在 Flash 擦写期间回调进入，平台层单次输出须设等待上限，见 [六、平台适配层](#六平台适配层fw_port)；
-- **项目专有字段不入库**：库内只提供升级流程通用文案。App 就绪一类日志中的波特率、标定点数等字段由调用方以格式串传入，例如 `fw_msg_app_ready("baud=%u cal=%u", baud, cal)`，传入 `NULL` 时只输出 `Ready`；需要其它内容时可直接调用 `fw_port_log_printf()`。
+- **项目专有字段不入库**：库内只提供升级流程通用文案。App 就绪一类日志的附加字段由调用方以格式串传入，例如 `fw_msg_app_ready("a=%u b=%u", a, b)`，传入 `NULL` 时只输出 `Ready`；需要其它内容时可直接调用 `fw_port_log_printf()`。
 
 `fw_kv` 通过 `fw_kv_set_log()` 注册回调输出日志，库本身不依赖 `fw_msg`。适配器位于 `library/src/fw_msg.c` 的 `fw_msg_kv_log_attach()`，由 `main()` 调用一次；分区名由回调直接给出，日志模块无需访问 KV 实例字段。
 
@@ -449,13 +451,14 @@ iap_state_t fw_iap_get_status(uint32_t *total_size, uint32_t *received_size, uin
 | 开关 | 位置 | 取值 |
 |---|---|---|
 | `FW_BOOT_UPGRADE_MODE` | `library/inc/fw_boot.h` | `0` 覆写 / `1` 交换 / `2` 就地执行 |
-| `FW_BOOT_IAP_ENABLE` | `library/inc/fw_boot.h` | `1` 无有效镜像时支持串口升级 / `0` 关闭 |
 | `FW_BOOT_BUILD_LOADER` | 工程选项；`library/inc/fw_boot.h` 内 `#ifndef` 兜底为 `1` | `0` 引导构建 / `1` 应用构建 |
 | `configUSE_FREERTOS` | 工程选项；仅 `library/src/fw_port.c` 内兜底 | `1` 时平台层临界区用 FreeRTOS 互斥锁，`0` 时用关中断 |
 | `FW_ERASED_VALUE` | `library/inc/fw_cfg.h` | `0x00` / `0xFF` |
 | `FW_KV_*` | `library/inc/fw_cfg.h` | GC 阈值、扇区页数、缓冲、扇区大小 |
 | `FW_MSG_ENABLE` / `FW_MSG_EN_*` | `library/inc/fw_msg.h` | 日志总开关与分项开关 |
 | `FW_LIB_VERSION` | `library/inc/fw_msg.h` | 库自身版本，由库维护者随发布更新，不使用 `#ifndef`；不参与打印 |
+| `FW_IMG_PROJECT_ID` | `library/inc/fw_cfg.h` | 水印项目编号(u32)；设备侧据此拒绝别的项目的固件 |
+| `FW_IAP_DELTA_ENABLE` | `library/inc/fw_iap.h` | `1` 编译差分升级(App 构建) / `0` 不编译(BL 构建) |
 | `FW_ASSERT_ENABLE` | `library/inc/fw_assert.h` | `1` 保留断言检查 / `0` 全部编译掉 |
 | `FW_FLASH_PAGE_SIZE` / `FW_FLASH_WRITE_BYTE` / `FW_EEPROM_PAGE_SIZE` / `FW_EEPROM_WRITE_BYTE` / `FW_PORT_RX_BUF_SIZE` | `library/inc/fw_cfg.h`（平台填写） | 平台器件能力，库据此切分擦写并校验串口缓冲 |
 | `FW_PORT_LOG_LINE_MAX` | `library/inc/fw_port.h` | 一行日志最大字节数，默认 64，含 `\r\n` |
@@ -502,7 +505,34 @@ FW_BOOT_BUILD_LOADER=1     // 应用构建
 
 - `fw_boot_handler()` 与 `fw_boot_jump_to_app()` 仅在 `FW_BOOT_BUILD_LOADER == 0` 时编译；
 - 三个升级策略文件 `library/src/fw_overwrite.c`、`library/src/fw_swap.c`、`library/src/fw_xip.c` 仅在 `FW_BOOT_BUILD_LOADER == 0` 时编译；
-- `library/src/fw_iap.c` 在 `FW_BOOT_BUILD_LOADER == 1` 时始终编译。
+- `library/src/fw_iap.c` 在两种构建里都参与编译：应用构建用它接收固件，引导构建用它兜底接收固件。
+
+
+### 9.1 库的资源占用
+
+下表按 Keil ARMCC5 的 map 文件统计，只计入 `library/` 下的 `fw_*.o`，不含工程自身的应用代码、HAL 与 RTOS。
+
+| 构建 | 库 ROM | 库 RAM | 占该构建 ROM | 占该构建 RAM |
+|---|---|---|---|---|
+| 应用构建 | 8927 字节（8.7 KB） | 816 字节 | 20.7%（43052 中） | 5.9%（13920 中） |
+| 引导构建 | 9697 字节（9.5 KB） | 1124 字节 | 43.9%（22076 中） | 33.3%（3376 中） |
+
+ROM = Code + RO Data + RW Data（RW 的初值同样占 Flash）；RAM = RW Data + ZI Data。
+
+| 模块 | 应用 ROM | 应用 RAM | 引导 ROM | 引导 RAM |
+|---|---|---|---|---|
+| `fw_kv.o` | 4710 | 260 | 4710 | 260 |
+| `fw_iap.o` | 1642 | 308 | 1078 | 132 |
+| `fw_delta.o` | 818 | 0 | — | — |
+| `fw_img.o` | 582 | 0 | 718 | 0 |
+| `fw_port.o` | 426 | 4 | 606 | 0 |
+| `fw_msg.o` | 386 | 56 | 1462 | 56 |
+| `fw_boot.o` | 272 | 188 | 648 | 548 |
+| `fw_overwrite.o` | — | — | 384 | 128 |
+| `fw_cfg.o` | 91 | 0 | 91 | 0 |
+| **合计** | **8927** | **816** | **9697** | **1124** |
+
+差异来自构建条件：`fw_delta.o` 只在应用构建编译（差分升级），`fw_overwrite.o` 只在引导构建编译（覆写策略），`fw_msg.o` 与 `fw_port.o` 在引导构建里编入了更多平台与提示代码，`fw_boot.o` 的 ZI 主要是引导主流程的暂存缓冲。
 
 ---
 
@@ -566,13 +596,12 @@ typedef enum
 {
   FW_KV_KEY_BOOT_FLAG     = 0x01,   /* STAGE：升级信令标志 */
   FW_KV_KEY_BOOT_PROGRESS = 0x02,   /* STAGE：交换进度或 XIP 运行槽位 */
-  FW_KV_KEY_BOOT_SIZE     = 0x03,   /* STAGE：固件实际大小 */
-  FW_KV_KEY_BOOT_SCRATCH  = 0x04,   /* STAGE：交换模式单页暂存 */
+  FW_KV_KEY_BOOT_SCRATCH  = 0x03,   /* STAGE：交换模式单页暂存 */
   FW_KV_KEY_APP_PARAM     = 0x10    /* 示例：应用自定义键，编号由使用方决定 */
 }fw_kv_key_t;
 ```
 
-前四项由引导逻辑使用，编号固定。应用自定义键的编号由使用方决定，只需保证与同分区内的其它键不重复；示例中的 `0x10` 仅为取值示范。
+前三项由引导逻辑使用，编号固定。应用自定义键的编号由使用方决定，只需保证与同分区内的其它键不重复；示例中的 `0x10` 仅为取值示范。
 
 ### 11.3 三种升级模式的布局差异
 
@@ -588,20 +617,86 @@ typedef enum
 
 ---
 
-## 十二、产线烧录工具
+## 十二、发布打包工具
 
-`产线烧录工具/` 是随库提供的 PC 端串口烧录工具，由 PowerShell 脚本实现，批处理文件作为双击入口。它不属于库本身，不参与库的构建。
+`mkimg/` 存放编译期的发布打包工具，不属于库本身，不参与库的构建，只有两个文件：
 
-作用：把待烧录的应用固件通过串口发送给设备，由设备端的 IAP 接收并写入升级槽；设备复位后由引导程序完成实际升级。
+| 文件 | 说明 |
+|---|---|
+| `mkimg.c` | 单文件C源码，只依赖C标准库，元数据拼装与两套CRC都在本文件内实现 |
+| `mkimg.exe` | Windows编译产物，静态链接，只依赖系统自带的`KERNEL32.dll`与`msvcrt.dll` |
 
-适用场景：
+App工程的Keil`After Build`钩子直接调用它：
 
-- 批量烧录：操作人员仅需一根 USB 转串口线与固件文件，不需要编译环境，也不需要调试器；
-- 现场升级：设备已在运行应用时，使用同一套工具与同一套协议完成升级。
+```
+    ..\..\mkimg\mkimg.exe ".\<输出目录>\<工程>.bin" ".\<输出目录>\<工程>.pkg.bin"
+```
 
-工具与库之间的接口是 IAP 协议，即 `library/src/fw_iap.c` 实现的文本 `$UP` 协议。帧格式、CRC16 初值与多项式必须与设备端一致，细节见 `产线烧录工具/工具说明.md`。
+流程为：`fromelf --bin` 产出纯代码 bin → `mkimg.exe` 在代码末尾追加 64 字节镜像元数据 → 输出 `<工程>.pkg.bin`，即交付烧录的发布包。
 
-工具目录中的 `app.bin` 是占位文件，用于说明固件的放置位置与命名；实际烧录时替换为编译产出的固件。
+镜像版本、项目水印、客户号、批次号、构建日期都在`mkimg.c`顶部的`META_*`宏里配置，改完重新编译`mkimg.exe`即可。临时覆盖用命令行参数：
+
+```
+mkimg.exe app.bin app.pkg.bin --version 1.0.4 --project 2 --customer 1 --batch 3
+```
+
+重新编译：
+
+```
+Windows: gcc -O2 -std=c99 -static -static-libgcc mkimg.c -o mkimg.exe
+Linux:   gcc -O2 -std=c99 -static mkimg.c -o mkimg
+```
+
+镜像元数据紧贴代码末尾，布局为`[代码(code_len字节)][镜像元数据(64字节)][空余擦除态]`，设备端由`fw_img_locate()`扫描魔数定位。字段定义与CRC算法见`library/inc/fw_img.h`与`library/src/fw_img.c`。
+
+串口烧录由 `fwdelta/` 下的 Qt 上位机 `fw_delta.exe` 负责，它只接受带镜像元数据的发布包。上位机与设备之间的接口是 HEX 协议，由 `library/src/fw_iap.c` 实现，帧格式与 CRC16 初值、多项式必须与设备端一致。
+
+### 12.1 上位机构建与运行时部署
+
+上位机源码在 `fwdelta/fw_delta/`，构建产物输出到 `fwdelta/bin/`。构建（以 Windows + MinGW 为例）：
+
+    cd fwdelta/fw_delta
+    qmake fw_delta.pro
+    mingw32-make -j4
+
+发布时还要把 Qt 运行时复制到同一个目录，用 Qt 自带的部署工具：
+
+| 平台 | 命令 |
+| --- | --- |
+| Windows | `windeployqt --release --compiler-runtime --qmldir fwdelta/fw_delta/qml fwdelta/bin/fw_delta.exe` |
+| Linux | `windeployqt --release --qmldir fwdelta/fw_delta/qml fwdelta/bin/fw_delta` |
+| macOS | `macdeployqt fwdelta/bin/fw_delta.app -qmldir=fwdelta/fw_delta/qml` |
+
+`--qmldir` 指向 QML 源码目录，必须传。不带它时部署工具只认识二进制依赖，QML 模块树与样式插件（例如 `Qt6QuickControls2Material.dll`）都不会被复制，程序启动时找不到 QML 模块会直接退出，界面上不报错。
+
+`bin/` 下只有 `fw_delta.exe` 需要纳入版本管理，其余运行时文件由上面的命令现场生成。
+
+### 12.2 烧录与更新流程（推荐）
+
+**为什么 Keil 的下载按钮烧不了发布包**：镜像元数据里的 `code_crc32` 与 `image_len` 都要等链接完成才能算出来，而 Keil 的下载烧的是 `.axf` 的加载域，编译产出的 `.bin` 与 `.pkg.bin` 都不参与下载。所以从 Keil 界面点下载得到的镜像只有代码、没有元数据。
+
+**推荐流程：调试器只烧 BootLoader，App 走串口。**
+
+| 步骤 | 用什么 | 烧什么 | 说明 |
+| --- | --- | --- | --- |
+| 1 | Keil 或任意调试器 | BootLoader 的裸 bin | BootLoader 不需要元数据，直接烧到 `FLASH_BASE_ADDR` |
+| 2 | 上位机 `fw_delta` | App 的发布包（`.pkg.bin`） | 通过串口发送，设备写 SLOT1，复位后 BL 覆写到 SLOT0 |
+| 之后 | 上位机 `fw_delta` | 任意新版本 pkg | 不再需要调试器 |
+
+BootLoader 只在首次给空板烧写时用到，烧完就不再需要。之后所有 App 更新都通过串口完成，使用者手里有没有调试器都不影响。
+
+**如果一定要用调试器烧 App**，把 App 的发布包（`.pkg.bin`）当普通二进制烧到 `SLOT0_ADDR`，不要烧不带元数据的 `.bin`。下面命令里的 `app.pkg.bin` 与地址都按实际工程替换：`FLASH_BASE_ADDR` 与 `SLOT0_ADDR` 由 `library/inc/fw_cfg.h` 决定，槽位起点随分区布局不同，不一定是下面示例的那个值。
+
+| 调试器 | 命令 |
+| --- | --- |
+| J-Link | `loadbin app.pkg.bin, SLOT0_ADDR` |
+| ST-Link | `ST-LINK_CLI.exe -P app.pkg.bin SLOT0_ADDR` |
+| DAPLink / pyOCD | `pyocd flash -a SLOT0_ADDR app.pkg.bin` |
+| OpenOCD | `openocd -c "program app.pkg.bin SLOT0_ADDR verify"` |
+
+发布包是标准二进制，换调试器只影响命令写法，不影响内容。
+
+**调试时直接烧裸 bin 会怎样**：`fw_img_verify_full()` 找不到 `IMGH` 元数据，判定 SLOT0 无效，设备停在 BootLoader 等串口升级。这是预期行为，不是故障。
 
 ---
 
@@ -625,9 +720,7 @@ int main(void)
 
     while(1)
     {
-#if (FW_BOOT_IAP_ENABLE != 0)
         fw_boot_iap_poll();   /* ⑥ 串口升级轮询，非阻塞 */
-#endif
         平台喂狗函数();          /* ⑦ 喂狗：直接调用平台自己的接口 */
         /* 其它空闲处理 */
     }
@@ -643,7 +736,7 @@ int main(void)
 | ③ | `fw_msg_banner(fw_version)` | 输出一行版本横幅（前缀、调用方传入的版本串、编译日期），用于确认设备当前运行的是哪份固件。传 `NULL` 则不打版本串 |
 | ④ | `fw_boot_handler()` | 引导主流程，按阶段依次做完：读升级标志与两个槽位的有效性 → 恢复上次被中断的升级 → 处理强制回滚 → 按升级模式执行升级 → 选择有效镜像并**跳转**。跳转成功时**不返回**；两个槽位都没有有效镜像时返回 |
 | ⑤ | `fw_msg_waiting()` | 只在 ④ 返回后才执行，输出"需要重新烧录 / 等待串口升级"提示。不要挪到 ④ 之前，否则正常启动的设备也会打印它 |
-| ⑥ | `fw_boot_iap_poll()` | 仅引导构建且开启 IAP 时参与编译。**非阻塞**：取一帧 → 按帧头分发 → 写入目标槽位 → 整包校验通过后写 `VALID` 标志。由主循环反复调用，不能在里面阻塞等待整包 |
+| ⑥ | `fw_boot_iap_poll()` | 仅引导构建参与编译。**非阻塞**：取一帧 → 按帧头分发 → 写入目标槽位 → 整包校验通过后写 `VALID` 标志。由主循环反复调用，不能在里面阻塞等待整包 |
 | ⑦ | 平台喂狗 | 直接调用平台的看门狗刷新接口。库内不喂狗，喂狗由平台后端的擦写原语与使用方负责 |
 
 ### 13.2 应用构建
@@ -672,8 +765,8 @@ void Start_Task(void *parameter)
     /* ⑥ 确认本次升级有效；不调用会在下次复位时被引导程序回滚（仅模式 1/2；模式 0 不支持回滚） */
     fw_boot_set_confirmed();
 
-    /* ⑦ 就绪日志：项目专有字段由调用方以格式串传入 */
-    fw_msg_app_ready("baud=%u cal=%u", (unsigned)baud, (unsigned)cal_count);
+    /* ⑦ 就绪日志：附加字段由调用方以格式串传入，字段名与数量自定 */
+    fw_msg_app_ready("a=%u b=%u", (unsigned)a, (unsigned)b);
 
     vTaskDelete(NULL);
 }
@@ -689,8 +782,8 @@ void Start_Task(void *parameter)
 | ④ | 创建任务 + 启动调度器 | 应用主逻辑与串口接收都交给任务；本库自身不创建任务 |
 | ⑤ | 应用初始化 | 完成应用自己的外设与参数初始化 |
 | ⑥ | `fw_boot_set_confirmed()` | **确认升级有效**：写入 `CONFIRMED` 标志。引导程序下次复位时若发现升级未被确认，会自动回滚到上一份固件（仅模式 1/2；模式 0 覆写成功后由引导自己写 CONFIRMED，不存在未确认状态）。必须在应用真正跑起来之后调用，调用过早会把坏固件也确认掉 |
-| ⑦ | `fw_msg_app_ready(...)` | 输出就绪日志，附带项目专有字段（波特率、标定计数等），字段由调用方以格式串传入 |
-| ⑧ | 串口升级接收 | 应用侧要支持串口升级时，按[第三章](#三串口升级iap)接入：串口空闲中断置位后唤醒接收任务，取走整帧再交给 `fw_iap_parse_text_frame()` 或 `fw_iap_parse_hex_frame()`。引导构建用 `fw_boot_iap_poll()` 承担同一职责 |
+| ⑦ | `fw_msg_app_ready(...)` | 输出就绪日志；附加字段由调用方以格式串传入，字段名与数量自定，不传则只输出 `Ready` |
+| ⑧ | 串口升级接收 | 应用侧要支持串口升级时，按[第三章](#三串口升级iap)接入：串口空闲中断置位后唤醒接收任务，取走整帧再交给 `fw_iap_parse_hex_frame()`。引导构建用 `fw_boot_iap_poll()` 承担同一职责 |
 
 ### 13.3 顺序要求与常见错误
 
@@ -700,6 +793,106 @@ void Start_Task(void *parameter)
 | 引导构建不要用互斥锁做临界区 | 无 OS 环境没有调度器 |
 | 应用构建不要用关中断做临界区 | 临界区可能包含 Flash 擦写，关中断会影响系统实时性 |
 | `fw_boot_set_confirmed()` 应在应用真正启动后调用 | 它是"升级有效"的凭证，调用过早会让坏固件也被确认 |
-| `fw_boot_handler()` 返回即表示没有可跳转的镜像 | 跳转成功时不返回，其后的提示与轮询代码不会被执行 |
 
-IAP 的收帧由接入层负责，整帧取到后调用 `fw_iap_parse_text_frame()` 或 `fw_iap_parse_hex_frame()`，见[第三章](#三串口升级iap)。
+---
+
+## 十四、镜像元数据与差分升级
+
+### 14.1 镜像元数据
+
+固定 64 字节，全部小端、无填充：
+
+| 偏移 | 长度 | 字段 |
+|---|---|---|
+| 0 | 4 | 魔数 `IMGH` |
+| 4 | 1 | 格式版本（当前 1） |
+| 5 | 1 | 保留 |
+| 6 | 2 | `hdr_len`（64） |
+| 8 | 4 | `image_len`（代码 + 64） |
+| 12 | 4 | 镜像版本 |
+| 16 | 4 | 项目水印 |
+| 20 | 2 | 客户号 |
+| 22 | 2 | 批次号 |
+| 24 | 4 | 构建日期 |
+| 28 | 4 | `code_crc32`：代码 CRC32 |
+| 32 | 30 | 保留，必须为 0 |
+| 62 | 2 | CRC16，覆盖前 62 字节 |
+
+镜像元数据随 START 帧下发，设备收满代码后紧贴代码末尾写入。`image_len` 是逻辑长度（代码 + 镜像元数据），不表示 Flash 占用长度。
+
+### 14.2 差分升级
+
+差分包由上位机 GUI 生成，记录流有三种（小端）：
+
+```
+COPY:    01 | 旧偏移 u16 | 长度 u16
+LITERAL: 02 | 长度 u16 | 数据
+DIFF:    03 | 旧偏移 u16 | 长度 u16 | count u16 | (块内偏移 u16, 差值 u8)*count
+```
+
+- COPY：旧镜像里有完全相同的一块，直接搬；
+- LITERAL：旧镜像里没有，发原始字节；
+- DIFF：旧块只有少量字节不同，设备先把旧块读进缓冲，再按 `(pos, val)` 逐点 `buf[pos] += val`，`len ≤ 128`。
+
+设备端 `fw_delta.c` 只做流式解码：旧镜像读取和新镜像写入都通过回调注入，本身不依赖 Flash、镜像元数据、CRC32 与升级协议。`fw_iap.c` 只做适配：START_DELTA、base_crc32 校验、回调实现、提交。
+
+上位机生成策略：
+
+- CDC 64/128/512、128/256/1024、256/512/2048、512/1024/4096 与固定 128/256/512 各算一遍，取记录流最小的；
+- 精确块未命中时，用 32 字节窗口哈希做偏移搜索，捞回整体移位但内容相同的块；
+- 仍不匹配的块，在旧镜像同偏移 ±4KB 内找差异最少的块，差异点足够少时发 DIFF，否则发 LITERAL；
+- 生成后本地回放，逐字节比对新固件，通过才写 `.fwd`。
+
+实测（加一句启动打印、代码段整体重排的场景）：优化前 68.7%，多参数+偏移搜索 37.9%，加入 DIFF 后 5.76%。
+
+START_DELTA 携带 `base_crc32` 与 `delta_len`；设备先比对旧镜像元数据里登记的代码 CRC32 校验基版本，不符回 `0x0E`。差分只在 App 构建启用；BL 没有旧镜像可作基，收到 START_DELTA 回 `0x10`。
+
+### 14.3 可复现构建
+
+`fw_cfg.h` 的 `FW_BUILD_DATE` 默认取 `__DATE__`；需要跨天可复现时，在工程选项里固定成 `"yyyy-mm-dd"`。同一份源码连续编译两次应得到逐字节一致的 `.bin`，否则先排查时间戳、链接顺序、路径等不确定因素。
+
+### 14.4 上位机工程结构
+
+`fwdelta/` 是差分生成工具，工程在 `fw_delta/`：
+
+```
+fw_delta/fw_delta.pro   qmake 工程，产物 fw_delta.exe
+fw_delta/core/          差分算法、镜像元数据、.fwd 打包解析，纯 C++
+fw_delta/transport/     传输接口、串口实现、HEX协议上传器
+fw_delta/res/           应用图标与 qrc
+```
+
+传输层已抽成 `IFirmwareTransport` 接口：`SerialTransport` 是当前串口实现，`FirmwareUploader` 只依赖接口做 HEX 帧、重试和进度。以后加 TCP/HTTP 传输，只需新增一个实现类，界面和协议层都不用改。
+
+构建：
+
+```powershell
+cd fw_delta
+mkdir build
+cd build
+qmake ..\fw_delta.pro
+mingw32-make -j4
+```
+
+产物在 `fwdelta/bin/fw_delta.exe`（`fw_delta.pro` 的 `DESTDIR` 指到上一级 `bin`）。GUI 直接调用 `core/`，串口发送用 `QSerialPort`，不依赖 PowerShell 脚本，因此 Windows、Linux、macOS 都可以编译运行。
+
+单文件发布时用 Enigma Virtual Box 把 exe 与 Qt DLL、`platforms/qwindows.dll` 一起虚拟化；Qt 插件目录层级保持不变。
+
+### 14.5 状态码
+
+| 码 | 含义 |
+|---|---|
+| `0x00` | 成功 |
+| `0x01` | 坏帧 |
+| `0x02` | 未开始 |
+| `0x03` | 镜像过大或长度不符 |
+| `0x04` | 写 Flash 失败 |
+| `0x06` | 提交失败 |
+| `0x07` | 镜像无效 |
+| `0x08` | 水印不符 |
+| `0x09` | 偏移不连续 |
+| `0x0A` | 版本过低：本次镜像版本低于设备当前运行的镜像版本 |
+| `0x0D` | 代码 CRC32 不符 |
+| `0x0E` | 基版本不符 |
+| `0x0F` | 差分记录流格式/长度错误 |
+| `0x10` | 当前构建不支持差分（BL） |

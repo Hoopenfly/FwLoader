@@ -52,7 +52,17 @@ void fw_assert_fail(const char *cond, const char *file, uint32_t line);
 #endif
 
 /* 编译期断言：用于常量条件(表大小、结构体长度)，不占用运行时间与Flash。
- * _Static_assert要求C11；ARMCC5等工具链改用其自带的静态断言 */
-#define FW_STATIC_ASSERT(cond, msg) _Static_assert(cond, msg)
+ * C11及以上的编译器直接用_Static_assert；更老的C99工具链(ARMCC5等)
+ * 用"条件不成立时数组长度为负"的技巧，失败信息体现为数组长度非法。 */
+#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
+  #define FW_STATIC_ASSERT(cond, msg)  _Static_assert(cond, msg)
+#elif defined(__cplusplus) && (__cplusplus >= 201103L)
+  #define FW_STATIC_ASSERT(cond, msg)  static_assert(cond, msg)
+#else
+  #define FW_STATIC_ASSERT_CAT_(a, b)  a##b
+  #define FW_STATIC_ASSERT_CAT(a, b)   FW_STATIC_ASSERT_CAT_(a, b)
+  #define FW_STATIC_ASSERT(cond, msg)                                          \
+    typedef char FW_STATIC_ASSERT_CAT(fw_static_assert_line_, __LINE__)[(cond) ? 1 : -1]
+#endif
 
 #endif /* _FW_ASSERT_H_ */

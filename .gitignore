@@ -1,9 +1,10 @@
 # ========================================================================
 # FwLoader：GitHub 忽略规则
 #
-# 原则：源码、文档、工具脚本等仓库内容全部入库，包括 产线烧录工具/ 下的
-# 说明文档、脚本与 app.bin。
-# 只忽略两类东西：构建过程新生成的中间文件与 IDE 状态文件、烧录工具的运行记录。
+# 原则：源码、文档、QML 界面、图标资源、打包工具（mkimg）源码与产物入库。
+# 不入库的有三类：上位机的可执行文件（由使用者自行编译）、构建过程生成
+# 的中间文件与 IDE 状态文件、上位机运行所需的 Qt 运行时库（体积上百 MB，
+# 随 Release 包分发）。
 # ========================================================================
 
 # -------------------- 编译器中间产物 --------------------
@@ -49,6 +50,50 @@ settings/
 .cproject
 .metadata/
 
+# -------------------- Qt / qmake / CMake --------------------
+# 这些文件每次构建都会重新生成，内容随本机 Qt 路径变化，不适合入库
+*.pro.user
+*.pro.user.*
+.qmake.stash
+Makefile
+Makefile.Debug
+Makefile.Release
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.qmltypes
+*_metatypes.json
+fw_delta_qmltyperegistrations.cpp
+fw_delta_resource.rc
+.qtcreator/
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+
+# -------------------- 上位机可执行文件 --------------------
+# 上位机由使用者自行编译，不提交任何 fw_delta.exe
+fwdelta/*.exe
+fwdelta/bin/*.exe
+
+# -------------------- 上位机运行库 --------------------
+# fwdelta/bin 下的 Qt 运行时（DLL 与 qml 模块目录）随 Release 包分发，不入库
+fwdelta/bin/*.dll
+fwdelta/bin/qml/
+fwdelta/bin/platforms/
+fwdelta/bin/styles/
+fwdelta/bin/tls/
+fwdelta/bin/generic/
+fwdelta/bin/iconengines/
+fwdelta/bin/imageformats/
+fwdelta/bin/networkinformation/
+
+# -------------------- 差分升级验证的临时目录 --------------------
+# 本地实机联调产生的抓包、截图、脚本，不属于仓库内容
+_verify_tmp/
+
 # -------------------- 编辑器与系统 --------------------
 .vscode/
 .idea/
@@ -58,7 +103,3 @@ settings/
 Thumbs.db
 desktop.ini
 .DS_Store
-
-# -------------------- 烧录工具运行记录 --------------------
-# 每次烧录都会在 产线烧录工具/log/ 下留一份记录，属于运行产物，不入库
-产线烧录工具/log/

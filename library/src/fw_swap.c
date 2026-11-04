@@ -1,4 +1,4 @@
-﻿/**
+/**
 * @file    fw_swap.c
 * @brief   升级策略-模式1：交换
 * @note    见 fw_strategy.h 的接口说明；本文件只在对应模式下编译。
@@ -10,11 +10,19 @@
 #include "fw_msg.h"
 #include "fw_kv.h"
 #include "fw_port.h"   //平台抽象接口
+#include "fw_assert.h"//FW_STATIC_ASSERT：暂存记录尺寸的编译期检查
+#include "fw_img.h"    //fw_img_locate：按元数据取镜像实际长度
 
 #if (FW_BOOT_BUILD_LOADER == 0) && (FW_BOOT_UPGRADE_MODE == 1)
 
 //交换时的单页暂存缓冲：4字节页号 + 整页数据
 static uint8_t boot_scratch_buf[4 + FW_FLASH_PAGE_SIZE];
+
+/* 暂存记录最终写进KV，其长度必须能装进一个KV扇区，否则交换升级在写第一条
+ * scratch时就失败，而且只表现为策略函数返回-1。配置错误在这里直接拦下：
+ * 记录长度 = 节点头16 + (页号4 + 页数据) + CRC4 */
+FW_STATIC_ASSERT((4 + FW_FLASH_PAGE_SIZE + 24) <= FW_KV_SECTOR_SIZE,
+    "boot scratch record must fit into one KV sector");
 
 //页缓冲区：读一页/写一页的搬运缓冲
 static __attribute__((aligned(FW_FLASH_WRITE_BYTE))) uint8_t boot_page_buf[FW_FLASH_PAGE_SIZE];
@@ -39,16 +47,18 @@ static int fw_swap_progress_write(uint32_t progress)
 }
 
 /**
-* @brief   计算交换模式需要交换的页数（依据固件实际大小）
+* @brief   计算交换模式需要交换的页数（依据镜像元数据里的image_len）
 * @return  需要交换的页数
-* @note    固件大小未写入（0）或超出SLOT时，回退到整个SLOT的页数
+* @note    元数据定位失败或长度非法时，回退到整个SLOT的页数
 */
 static uint32_t fw_swap_num_pages(void)
 {
-  uint32_t total_size = fw_boot_image_size_read();
-  if(total_size == 0 || total_size > SLOT_SIZE)
+  uint32_t total_size = SLOT_SIZE;
+  fw_img_meta_t meta;
+  if((fw_img_locate(SLOT0_ADDR, SLOT_SIZE, &meta) == FW_IMG_OK) &&
+     (meta.image_len > 0u) && (meta.image_len <= SLOT_SIZE))
   {
-    total_size = SLOT_SIZE;
+    total_size = meta.image_len;
   }
   return(total_size + FW_FLASH_PAGE_SIZE - 1) / FW_FLASH_PAGE_SIZE;
 }
@@ -190,6 +200,54 @@ static int fw_swap_page_equal(uint32_t a1, uint32_t a2)
 }
 
 /**
+* @brief   判断Flash地址处整页是否处于擦除态
+* @param   addr  Flash地址
+* @return  1=整页擦除态，0=存在已编程数据或读取失败
+* @note    擦除态取值随器件而异，这里按FW_ERASED_VALUE构造比较基准，
+*          不假定一定是全0xFF。
+*/
+static int fw_swap_page_is_erased(uint32_t addr)
+{
+  uint32_t word;
+  uint32_t erased = ((uint32_t)FW_ERASED_VALUE << 24) | ((uint32_t)FW_ERASED_VALUE << 16) |
+           ((uint32_t)FW_ERASED_VALUE << 8) | (uint32_t)FW_ERASED_VALUE;
+
+  for(uint32_t off = 0; off < FW_FLASH_PAGE_SIZE; off += sizeof(uint32_t))
+  {
+    if(fw_port_flash_read(addr + off, (uint8_t *)&word, sizeof(word)) != 0)
+    {
+      return 0;
+    }
+    if(word != erased)
+    {
+      return 0;
+    }
+  }
+  return 1;
+}
+
+/**
+* @brief   拷贝暂存KV到SLOT0页
+* @param   page  页号
+* @return   0成功，-1失败
+* @note    用于交换停在"SLOT0已擦除、新数据未写入"时的回退：把旧固件写回SLOT0，
+*          避免后续把空的SLOT0当成旧固件来源。
+*/
+static int fw_swap_copy_scratch_to_slot0(uint32_t page)
+{
+  uint32_t slot0_pg = SLOT0_ADDR + page * FW_FLASH_PAGE_SIZE;
+  if(fw_swap_scratch_kv_load(page) != 0)
+  {
+    return -1;
+  }
+  if(fw_port_flash_erase(slot0_pg, FW_FLASH_PAGE_SIZE) != 0)
+  {
+    return -1;
+  }
+  return fw_port_flash_write(slot0_pg, boot_page_buf, FW_FLASH_PAGE_SIZE);
+}
+
+/**
 * @brief   使用Scratch区恢复中断的交换操作
 * @return  0表示恢复成功
 * @note    progress是已完成页数，从page=progress继续。每页靠"暂存内容 + 整页比较"
@@ -225,6 +283,17 @@ static int fw_swap_recover(void)
     else if(fw_swap_buf_page_equal(boot_page_buf, slot1_pg))
     {
       //当前页第3步后：已完成交换，无需重做
+    }
+    else if(fw_swap_page_is_erased(slot0_pg))
+    {
+      /*当前页第2步擦除后、新数据写入前掉电：SLOT0是空的，旧固件只存在于暂存里。
+        必须先写回SLOT0，否则下面的完整交换会把空的SLOT0当成旧固件来源，
+        把唯一的旧固件备份覆盖掉。*/
+      if(fw_swap_copy_scratch_to_slot0(page) != 0)
+      {
+        return -1;
+      }
+      do_full = 1;
     }
     else if(fw_swap_page_equal(slot0_pg, slot1_pg))
     {
@@ -326,7 +395,11 @@ void fw_strategy_rollback_flag(void)
   fw_msg_rollback_start();
   if(fw_strategy_rollback() == 0)
   {
-    fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED);         //回滚完成，置为已确认
+    //回滚完成，置为已确认；写失败会导致下次启动重复回滚，记一条错误便于定位
+    if(fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED) != 0)
+    {
+      fw_msg_error(FW_MSG_ERR_UPDATE, FW_BOOT_FLAG_CONFIRMED);
+    }
     boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);   //又交换了一轮，两个槽位都要重新校验
     boot_slot1_ok = fw_boot_image_is_valid(SLOT1_ADDR);
     fw_msg_rollback_done();
@@ -334,7 +407,10 @@ void fw_strategy_rollback_flag(void)
   else
   {
     fw_msg_error(FW_MSG_ERR_ROLLBACK, 0);
-    fw_boot_flag_write(FW_BOOT_FLAG_NONE);
+    if(fw_boot_flag_write(FW_BOOT_FLAG_NONE) != 0)
+    {
+      fw_msg_error(FW_MSG_ERR_UPDATE, FW_BOOT_FLAG_NONE);
+    }
   }
   boot_cur_flag = fw_boot_flag_read();
 }
@@ -466,8 +542,12 @@ int fw_strategy_rollback(void)
     int ret = fw_strategy_perform();
     if(ret == 0)
     {
-      //回滚完成后重置进度为NONE（清除COMPLETE状态）
-      fw_swap_progress_write(FW_SWAP_PROGRESS_NONE);
+      /*回滚完成后重置进度为NONE（清除COMPLETE状态）。这一步写失败时必须上报：
+        残留的COMPLETE标志会让下次启动误判交换未完成并重复执行恢复流程*/
+      if(fw_swap_progress_write(FW_SWAP_PROGRESS_NONE) != 0)
+      {
+        return -1;
+      }
     }
     return ret;
   }

@@ -12,8 +12,9 @@
 #include <string.h>
 #include "fw_msg.h"
 #include "fw_kv.h"
+#include "fw_img.h"      //fw_img_verify_full：跳转前回读代码算CRC32
 #include "fw_port.h"      //平台适配层：存储原语/取一帧/发一段/跳转(两种构建都用)
-#if (FW_BOOT_BUILD_LOADER == 0) && (FW_BOOT_IAP_ENABLE != 0)
+#if (FW_BOOT_BUILD_LOADER == 0)
   #include "fw_iap.h"          //串口升级协议解析(与App同一套)
 #endif
 //暂存区KV实例(策略文件也直接用fw_kv接口访问它)
@@ -130,25 +131,6 @@ int fw_boot_progress_write(uint32_t value)
 }
 
 /**
-* @brief   读取固件实际大小（字节）
-* @return  固件大小，读取失败或未写入返回0（擦除态）
-*/
-uint32_t fw_boot_image_size_read(void)
-{
-  return fw_boot_kv_read_u32(FW_KV_KEY_BOOT_SIZE, 0);
-}
-
-/**
-* @brief   写入固件实际大小（字节）
-* @param   size    固件大小
-* @return  0表示成功
-*/
-int fw_boot_image_size_write(uint32_t size)
-{
-  return fw_boot_kv_write_u32(FW_KV_KEY_BOOT_SIZE, size);
-}
-
-/**
 * @brief   校验镜像是否有效
 * @param   addr    镜像在Flash中的起始地址
 * @return  1=有效，0=无效
@@ -251,7 +233,14 @@ void fw_strategy_select_and_jump(void)
 {
   if(boot_slot0_ok)
   {
-    fw_boot_jump_to_app(SLOT0_ADDR);
+    /* 跳转前做一次完整校验：把代码区回读并重算CRC32，与镜像元数据登记的值比对。
+     * 向量表有效但内容不完整的镜像（覆写中途中断、写入出错）在这里被挡住，
+     * 按SLOT0无效处理，交给下面的SLOT1恢复路径。 */
+    if(fw_img_verify_full(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK)
+    {
+      fw_boot_jump_to_app(SLOT0_ADDR);
+    }
+    boot_slot0_ok = 0;
   }
   if(boot_slot1_ok && !boot_slot0_ok)
   {
@@ -268,7 +257,8 @@ void fw_strategy_select_and_jump(void)
     fw_msg_error(FW_MSG_ERR_SLOT0_BAD, 0);
     if(fw_strategy_perform() == 0)
     {
-      boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
+      //恢复同样要过完整校验：写入返回成功不等于Flash内容正确
+      boot_slot0_ok = (fw_img_verify_full(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
       if(boot_slot0_ok)
       {
         fw_boot_jump_to_app(SLOT0_ADDR);
@@ -284,17 +274,18 @@ void fw_strategy_select_and_jump(void)
 #endif /* FW_BOOT_UPGRADE_MODE == 0 || FW_BOOT_UPGRADE_MODE == 1 */
 
 
-#if (FW_BOOT_BUILD_LOADER == 0) && (FW_BOOT_IAP_ENABLE != 0)
+#if (FW_BOOT_BUILD_LOADER == 0)
 /**
 * @brief   串口升级的单次轮询(由主循环调用，非阻塞)
-* @note    从平台层取一帧，按帧头分发给对应协议；无法识别的帧静默丢弃，不作应答。
+* @note    从平台层取一帧，按帧头分发给HEX协议；无法识别的帧静默丢弃，不作应答。
 *          固件提交后提示一次，之后的复位由工作人员断电或按复位键完成。
 */
 void fw_boot_iap_poll(void)
 {
   static int inited = 0;//首次调用做一次性的准备
   static int committed = 0;//固件是否已提交(FW_BOOT_FLAG_VALID已写入)
-  static uint8_t frame[FW_IAP_RX_FRAME_MAX];
+  //缓冲按平台接收队列容量取，保证一次能把队列取空，不残留半个帧
+  static uint8_t frame[FW_PORT_RX_BUF_SIZE];
   uint16_t n = 0;
 
   if(!inited)
@@ -307,15 +298,10 @@ void fw_boot_iap_poll(void)
   {
     return;
   }
-  //HEX二进制协议：0x55 0xAA开头
-  if(n >= 2u && frame[0] == FW_IAP_HEX_SOF0 && frame[1] == FW_IAP_HEX_SOF1)
+  //HEX二进制协议：0x55 0xAA开头；块首的串口噪声字节由解析器自行跳过
+  if(n > 0u)
   {
     fw_iap_parse_hex_frame(frame, (uint32_t)n);
-  }
-  //文本协议：$UP/$UD开头
-  else if(n >= 3u && frame[0] == '$' && frame[1] == 'U' && (frame[2] == 'P' || frame[2] == 'D'))
-  {
-    fw_iap_parse_text_frame(frame, (uint32_t)n);
   }
 
   //固件已提交：提示一次，之后等工作人员复位
@@ -327,8 +313,12 @@ void fw_boot_iap_poll(void)
       fw_msg_serial_update_done();
     }
   }
+  else
+  {
+    committed = 0;   //标志已清除，下一轮升级重新允许提示
+  }
 }
-#endif /* FW_BOOT_BUILD_LOADER == 0 && FW_BOOT_IAP_ENABLE */
+#endif /* FW_BOOT_BUILD_LOADER == 0 */
 
 /**
 * @brief   Bootloader主处理函数，系统复位后调用
@@ -340,10 +330,11 @@ void fw_boot_handler(void)
 {
   //升级全程关闭接收中断，避免串口噪声中断风暴饿死Flash升级主循环
   fw_port_rx_irq_disable();
-  //初始化暂存区KV，失败则直接进入错误处理
+  //初始化暂存区KV，失败时仍恢复串口接收中断，保留串口升级这条恢复通道
   if(fw_boot_stage_init() != 0)
   {
     fw_msg_error(FW_MSG_ERR_KV_INIT, 0);
+    fw_port_rx_irq_enable();
     return;
   }
 
@@ -369,10 +360,8 @@ void fw_boot_handler(void)
   //========== 阶段5：没有可跳转的镜像 ==========
   fw_msg_error(FW_MSG_ERR_NO_IMAGE, 0);
   fw_boot_flag_write(FW_BOOT_FLAG_NONE);   //清除标志，避免反复重试
-#if (FW_BOOT_IAP_ENABLE != 0)
   //重新打开接收中断后返回，交给main的主循环处理后续帧
   fw_port_rx_irq_enable();
-#endif
 }
 
 #endif /* FW_BOOT_BUILD_LOADER */

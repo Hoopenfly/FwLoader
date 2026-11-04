@@ -23,18 +23,12 @@ uint32_t fw_xip_get_run_slot(void)
   slot &= FW_XIP_SLOT_MASK;//屏蔽确认位，仅提取槽位号
   if(slot != FW_XIP_RUN_SLOT0 && slot != FW_XIP_RUN_SLOT1)
   {
+    /*槽位号不在合法取值内，说明进度字段已损坏。回退到主槽SLOT0启动并留下错误
+      记录，避免带着未知槽位号继续运行*/
+    fw_msg_error(FW_MSG_ERR_UPDATE, slot);
     return FW_XIP_RUN_SLOT0;
   }
   return slot;
-}
-
-/**
-* @brief   检测XIP模式是否处于"待App确认"状态（CONFIRM_BIT已置位）
-* @return  0=正常状态，非0=升级已切换槽位但App尚未确认
-*/
-uint32_t fw_xip_is_pending_confirm(void)
-{
-  return(fw_boot_progress_read() & FW_XIP_CONFIRM_BIT) ? 1 : 0;
 }
 
 #endif /* FW_BOOT_UPGRADE_MODE == 2 */
@@ -42,9 +36,21 @@ uint32_t fw_xip_is_pending_confirm(void)
 #if (FW_BOOT_BUILD_LOADER == 0) && (FW_BOOT_UPGRADE_MODE == 2)
 
 //XIP运行状态(由fw_strategy_state_read填写)
-static uint32_t boot_run_slot;   //当前运行槽位
+//初值取"未初始化"而不是0：0恰好等于SLOT0，会让漏调state_read的路径静默按SLOT0运行
+#define FW_XIP_RUN_SLOT_UNKNOWN  0xFFFFFFFFu
+static uint32_t boot_run_slot = FW_XIP_RUN_SLOT_UNKNOWN;   //当前运行槽位
 static int      boot_cur_ok;     //当前运行槽位是否有有效镜像
 static int      boot_other_ok;   //对侧槽位是否有有效镜像
+
+/**
+* @brief   检测XIP模式是否处于"待App确认"状态（CONFIRM_BIT已置位）
+* @return  0=正常状态，非0=升级已切换槽位但App尚未确认
+* @note    只有引导侧用到：升级流程与未确认回滚都靠它判断是否还停在待确认阶段
+*/
+uint32_t fw_xip_is_pending_confirm(void)
+{
+  return(fw_boot_progress_read() & FW_XIP_CONFIRM_BIT) ? 1 : 0;
+}
 
 /**
 * @brief   写入XIP模式当前运行槽位
@@ -101,7 +107,11 @@ void fw_strategy_rollback_flag(void)
   fw_msg_rollback_start();
   if(fw_strategy_rollback() == 0)
   {
-    fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED);   //回滚完成，置为已确认
+    //回滚完成，置为已确认；写失败会导致下次启动重复回滚，记一条错误便于定位
+    if(fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED) != 0)
+    {
+      fw_msg_error(FW_MSG_ERR_UPDATE, FW_BOOT_FLAG_CONFIRMED);
+    }
     boot_run_slot = fw_xip_get_run_slot();     //读回滚之后的运行槽位
     boot_cur_ok = 1;                        //刚切过去的槽位必定有效
     boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
@@ -111,7 +121,10 @@ void fw_strategy_rollback_flag(void)
   else
   {
     fw_msg_error(FW_MSG_ERR_ROLLBACK, 0);
-    fw_boot_flag_write(FW_BOOT_FLAG_NONE);
+    if(fw_boot_flag_write(FW_BOOT_FLAG_NONE) != 0)
+    {
+      fw_msg_error(FW_MSG_ERR_UPDATE, FW_BOOT_FLAG_NONE);
+    }
   }
   boot_cur_flag = fw_boot_flag_read();
 }
@@ -205,7 +218,11 @@ void fw_strategy_select_and_jump(void)
   {
     uint32_t fallback_addr = (boot_run_slot == FW_XIP_RUN_SLOT0) ? SLOT1_ADDR : SLOT0_ADDR;
     uint32_t new_slot = (boot_run_slot == FW_XIP_RUN_SLOT0) ? FW_XIP_RUN_SLOT1 : FW_XIP_RUN_SLOT0;
-    fw_xip_set_run_slot(new_slot);
+    //切槽写失败不阻止本次跳转(对侧镜像是好的)，但要留下记录：否则每次上电都会重复走兜底
+    if(fw_xip_set_run_slot(new_slot) != 0)
+    {
+      fw_msg_error(FW_MSG_ERR_UPDATE, new_slot);
+    }
     fw_boot_jump_to_app(fallback_addr);
   }
 }

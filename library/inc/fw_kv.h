@@ -18,14 +18,14 @@ extern "C" {
   #define FW_KV_ERASED32  FW_ERASED_WORD
   #define FW_KV_SECTOR_EMPTY  FW_ERASED_WORD
   #define FW_KV_SECTOR_ACTIVE  (FW_KV_ERASED32 | 0x00000001U)
-  #define FW_KV_SECTOR_FULL  (FW_KV_ERASED32 | 0x00000003U)
+  #define FW_KV_SECTOR_FULL  (FW_KV_ERASED32 | 0x00000003U)	//仅为兼容留有FULL值的旧分区，本库从不写入该状态
   #define FW_KV_NODE_VALID  FW_KV_ERASED32
   #define FW_KV_NODE_DELETED  (FW_KV_ERASED32 | 0x00000001U)
 #elif (FW_ERASED_VALUE == 0xFF)
   #define FW_KV_ERASED32  FW_ERASED_WORD
   #define FW_KV_SECTOR_EMPTY  FW_ERASED_WORD
   #define FW_KV_SECTOR_ACTIVE  (FW_KV_ERASED32 & ~0x00000001U)
-  #define FW_KV_SECTOR_FULL  (FW_KV_ERASED32 & ~0x00000003U)
+  #define FW_KV_SECTOR_FULL  (FW_KV_ERASED32 & ~0x00000003U)	//仅为兼容留有FULL值的旧分区，本库从不写入该状态
   #define FW_KV_NODE_VALID  FW_KV_ERASED32
   #define FW_KV_NODE_DELETED  (FW_KV_ERASED32 & ~0x00000001U)
 #else
@@ -60,6 +60,15 @@ typedef struct
  * 三个函数形式：f(addr, buf, size)读；f(addr, const buf, size)写(任意地址/长度，
  * 内部读-改-写)；f(addr, size)擦(按扇区调用)。返回0=成功，非0=失败；
  * 工程里返回 xxx_err_t(OK=0) 的函数可直接写进来，宏里会转一下类型。
+ *
+ * 写函数必须满足的最小能力(接入前逐条确认)：
+ *   1) 支持任意字节地址，不要求调用方按写粒度对齐；
+ *   2) 支持任意长度，包括不是写粒度整数倍的长度；
+ *   3) 跨写粒度边界时自行完成"读出-合并-回写"，不能只写对齐部分；
+ *   4) 目标区域必须已是擦除态，本库不依赖写函数完成擦除。
+ * 原因：KV记录长度为 16 + value_len + 4，value_len 由调用方决定，CRC字段的写入
+ * 地址经常不是写粒度整数倍。只支持对齐编程、内部也不做读-改-写的驱动会让这类
+ * 写入静默失败或被截断，表现为"设置成功但读回CRC错误"。
  */
 #define FW_KV_OPS(read_fn, write_fn, erase_fn)                                                      \
   (&(const fw_flash_ops_t){ .read  = (int (*)(uint32_t, uint8_t *, uint32_t))(read_fn),             \
