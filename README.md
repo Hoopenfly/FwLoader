@@ -52,7 +52,7 @@ FwLoader/                              库与上位机工具所在目录
         mkimg.c                        打包工具源码，只用C标准库，追加镜像元数据生成发布包
         mkimg.exe                      Windows编译产物，供Keil After Build直接调用
     fwdelta/                           上位机差分生成工具，不属于库本身，见第十四节
-        fw_delta.exe                   已构建的界面程序
+        fw_delta.exe                   已构建的界面程序，不入库，随 Release 附件分发
         fw_delta/                      Qt 工程与界面
             fw_delta.pro               qmake 工程，DESTDIR 指向 ../bin
             core/                      差分算法与镜像元数据，纯 C++，不依赖 Qt
@@ -673,7 +673,7 @@ Linux:   gcc -O2 -std=c99 -static mkimg.c -o mkimg
 
 `--qmldir` 指向 QML 源码目录，必须传。不带它时部署工具只认识二进制依赖，QML 模块树与样式插件（例如 `Qt6QuickControls2Material.dll`）都不会被复制，程序启动时找不到 QML 模块会直接退出，界面上不报错。
 
-`fwdelta/` 下只有 `fw_delta.exe` 需要纳入版本管理（仓库当前把它放在 `fwdelta/` 根便于直接双击运行，构建产物仍输出到 `fwdelta/bin/`），其余运行时文件由上面的命令现场生成。
+`fwdelta/` 下的可执行文件与 Qt 运行时都不纳入版本管理（见 `.gitignore`），由上面的命令现场生成；需要给不装 Qt 的使用者时，`fw_delta.exe` 作为 GitHub Release 附件分发。
 
 ### 12.2 烧录与更新流程（推荐）
 
