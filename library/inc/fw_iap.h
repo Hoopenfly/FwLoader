@@ -79,7 +79,7 @@ typedef enum
 #define FW_IAP_HEX_ST_IMAGE_INVALID  0x07u     //镜像无效
 #define FW_IAP_HEX_ST_HW_MISMATCH    0x08u     //水印不符
 #define FW_IAP_HEX_ST_OFFSET_ERROR   0x09u     //OFFSET不连续
-#define FW_IAP_HEX_ST_VERSION_OLD    0x0Au     //版本过低(库当前不主动返回，保留编号兼容旧上位机)
+#define FW_IAP_HEX_ST_VERSION_OLD    0x0Au     //版本过低(新镜像版本号不高于当前镜像)
 #define FW_IAP_HEX_ST_CODE_CRC       0x0Du     //代码CRC32不符
 #define FW_IAP_HEX_ST_BASE_MISMATCH  0x0Eu     //旧镜像CRC32与差分基版本不符
 #define FW_IAP_HEX_ST_DELTA_FORMAT   0x0Fu     //差分记录流格式/长度错误

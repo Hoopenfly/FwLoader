@@ -237,6 +237,11 @@ void fw_port_jump_to_app(uint32_t app_addr)
   #define configUSE_FREERTOS  0
 #endif
 
+#if (configUSE_FREERTOS == 0)
+//进入临界区前的PRIMASK，退出时原样恢复
+static uint32_t s_kv_primask;
+#endif
+
 #if (configUSE_FREERTOS == 1)
 #include "FreeRTOS.h"
 #include "semphr.h"
@@ -268,18 +273,22 @@ void fw_port_kv_crit_unlock(void)
   }
 }
 #else
+
 void fw_port_kv_crit_init(void)
 {
 }
 
 void fw_port_kv_crit_lock(void)
 {
+  //先存再关：嵌套进入时内层存到的是1，退出后仍保持屏蔽
+  s_kv_primask = __get_PRIMASK();
   __disable_irq();
 }
 
 void fw_port_kv_crit_unlock(void)
 {
-  __enable_irq();
+  //按进入前的状态恢复，避免在已有临界区内调用时提前开中断
+  __set_PRIMASK(s_kv_primask);
 }
 #endif
 

@@ -43,8 +43,11 @@
 #define FW_IMG_OK             0
 #define FW_IMG_ERR_TRAILER   -2   //镜像元数据格式不符或与槽位不自洽
 #define FW_IMG_ERR_READ      -3   //Flash读取失败
-#define FW_IMG_ERR_PROJECT   -6   //镜像的项目标识与本机不符
 #define FW_IMG_ERR_CRC       -4   //代码CRC32与镜像元数据登记值不符
+#define FW_IMG_ERR_VERSION   -5   //镜像版本低于设备记录的最低版本
+#define FW_IMG_ERR_PROJECT   -6   //镜像的项目标识与本机不符
+#define FW_IMG_ERR_ADDR      -7   //地址不在主Flash范围内
+#define FW_IMG_ERR_VECTOR    -8   //向量表的栈顶或复位向量不在合法范围内
 
 /* 镜像元数据解析结果(由fw_img_meta_parse填充) */
 typedef struct
@@ -113,19 +116,28 @@ int fw_img_meta_parse(const uint8_t *buf, uint32_t len, fw_img_meta_t *out);
 int fw_img_meta_build(const fw_img_meta_t *meta, uint8_t *buf, uint32_t len);
 
 /**
-* @brief   检查镜像的项目水印是否与本机一致
+* @brief   校验镜像的项目水印是否与本机一致
 * @param   meta  已解析的镜像元数据
-* @return  0=一致，非0=不符
+* @return  FW_IMG_OK=一致，FW_IMG_ERR_PROJECT=不符，FW_IMG_ERR_TRAILER=入参为空
 */
-int fw_img_meta_project_ok(const fw_img_meta_t *meta);
+int fw_img_project_verify(const fw_img_meta_t *meta);
 
 /**
-* @brief   检查镜像版本是否不低于设备记录的最低版本
+* @brief   校验镜像版本是否不低于设备记录的最低版本
 * @param   image_ver  镜像版本
 * @param   min_ver    设备记录的最低允许版本
-* @return  0=允许，非0=版本过低
+* @return  FW_IMG_OK=允许，FW_IMG_ERR_VERSION=版本过低
 */
-int fw_img_ver_ok(uint32_t image_ver, uint32_t min_ver);
+int fw_img_ver_verify(uint32_t image_ver, uint32_t min_ver);
+
+/**
+* @brief   检查槽位起始处的向量表是否可用
+* @param   addr  镜像在Flash中的起始地址
+* @return  FW_IMG_OK=可用，负值=FW_IMG_ERR_*
+* @note    只读向量表前8字节：初始栈顶必须落在RAM内，复位向量必须落在主Flash内。
+*          不依赖镜像元数据，用于元数据还没写入的早期阶段。
+*/
+int fw_img_vectors_ok(uint32_t addr);
 
 /**
 * @brief   在槽位内定位并解析镜像元数据
@@ -139,26 +151,25 @@ int fw_img_ver_ok(uint32_t image_ver, uint32_t min_ver);
 int fw_img_locate(uint32_t addr, uint32_t slot_size, fw_img_meta_t *out);
 
 /**
-* @brief   校验一个槽位里的镜像
+* @brief   校验一个槽位里的镜像元数据：定位、自洽性、项目水印
 * @param   addr       槽位起始地址
 * @param   slot_size  槽位大小
 * @param   image_ver  输出：镜像版本，可为NULL
 * @return  FW_IMG_OK=有效，负值=FW_IMG_ERR_*
-* @note    只校验镜像元数据本身与项目水印；代码完整性由镜像元数据里的code_crc32在
-*          传输阶段校验，这里不重复读取代码。
+* @note    只读到镜像元数据为止，不读代码区，耗时与镜像大小无关。
+*          代码完整性由fw_img_crc32_verify()把关。
 */
-int fw_img_verify(uint32_t addr, uint32_t slot_size, uint32_t *image_ver);
-
+int fw_img_meta_verify(uint32_t addr, uint32_t slot_size, uint32_t *image_ver);
 
 /**
-* @brief   完整校验一个槽位里的镜像：定位元数据、查水印、回读代码算CRC32比对
+* @brief   完整校验一个槽位里的镜像：向量表、元数据、水印、代码CRC32
 * @param   addr       槽位起始地址
 * @param   slot_size  槽位大小
 * @param   image_ver  输出：镜像版本，可为NULL
 * @return  FW_IMG_OK=有效，负值=FW_IMG_ERR_*
-* @note    与fw_img_verify()的区别：本函数把代码区从Flash读回来重新累加CRC32，
-*          与元数据里的code_crc32比对，能发现写入不完整或Flash内容损坏。
-*          代价是遍历整个代码区，用时与镜像大小和器件读取速度成正比。
+* @note    与fw_img_meta_verify()的区别：本函数先查向量表，再把代码区从Flash
+*          读回来重新累加CRC32，与元数据里的code_crc32比对，能发现写入不完整
+*          或Flash内容损坏。代价是遍历整个代码区，用时与镜像大小成正比。
 */
-int fw_img_verify_full(uint32_t addr, uint32_t slot_size, uint32_t *image_ver);
+int fw_img_crc32_verify(uint32_t addr, uint32_t slot_size, uint32_t *image_ver);
 #endif /* _FW_IMG_H_ */

@@ -12,7 +12,7 @@
 #include <string.h>
 #include "fw_msg.h"
 #include "fw_kv.h"
-#include "fw_img.h"      //fw_img_verify_full：跳转前回读代码算CRC32
+#include "fw_img.h"      //fw_img_crc32_verify：跳转前回读代码算CRC32
 #include "fw_port.h"      //平台适配层：存储原语/取一帧/发一段/跳转(两种构建都用)
 #if (FW_BOOT_BUILD_LOADER == 0)
   #include "fw_iap.h"          //串口升级协议解析(与App同一套)
@@ -131,43 +131,6 @@ int fw_boot_progress_write(uint32_t value)
 }
 
 /**
-* @brief   校验镜像是否有效
-* @param   addr    镜像在Flash中的起始地址
-* @return  1=有效，0=无效
-* @note    只看向量表两项：初始栈顶落在RAM、复位向量落在Flash。
-*          不校验整包完整性，所以"写了一半"的镜像也可能通过。
-*/
-int fw_boot_image_is_valid(uint32_t addr)
-{
-  uint32_t msp;
-  uint32_t reset_addr;
-  //地址要落在主Flash内
-  if(addr < FLASH_BASE_ADDR || addr >= (FLASH_BASE_ADDR + FLASH_TOTAL_SIZE))
-  {
-    return 0;
-  }
-  //向量表第1项：初始栈顶，必须落在RAM内
-  if(fw_port_flash_read(addr, (uint8_t *)&msp, sizeof(msp)) != 0)
-  {
-    return 0;
-  }
-  if(msp < RAM_BASE_ADDR || msp >= RAM_END_ADDR)
-  {
-    return 0;
-  }
-  //向量表第2项：复位向量，必须落在Flash内
-  if(fw_port_flash_read(addr + 4, (uint8_t *)&reset_addr, sizeof(reset_addr)) != 0)
-  {
-    return 0;
-  }
-  if(reset_addr < FLASH_BASE_ADDR || reset_addr >= (FLASH_BASE_ADDR + FLASH_TOTAL_SIZE))
-  {
-    return 0;
-  }
-  return 1;
-}
-
-/**
 * @brief   确认当前运行的镜像有效
 * @note    由App正常启动后调用。若App没起来(看门狗复位)，
 *          下次Boot检测到VALID未被确认会自动回滚(仅模式1/2)
@@ -236,7 +199,7 @@ void fw_strategy_select_and_jump(void)
     /* 跳转前做一次完整校验：把代码区回读并重算CRC32，与镜像元数据登记的值比对。
      * 向量表有效但内容不完整的镜像（覆写中途中断、写入出错）在这里被挡住，
      * 按SLOT0无效处理，交给下面的SLOT1恢复路径。 */
-    if(fw_img_verify_full(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK)
+    if(fw_img_crc32_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK)
     {
       fw_boot_jump_to_app(SLOT0_ADDR);
     }
@@ -245,7 +208,7 @@ void fw_strategy_select_and_jump(void)
   if(boot_slot1_ok && !boot_slot0_ok)
   {
     /* 只有"固件已提交"才允许用SLOT1恢复SLOT0。
-     * fw_boot_image_is_valid()只看向量表两项，而IAP从偏移0开始发，
+     * 而只看向量表两项时，IAP从偏移0开始发，
      * 第一帧(300字节)就覆盖了整个向量表——所以"收到一帧就断电"的残包
      * 也会被判为有效。整包CRC16通过的凭证是FW_BOOT_FLAG_VALID，
      * 没有它说明SLOT1里可能只是半包，搬过去会让App跑飞。 */
@@ -258,7 +221,7 @@ void fw_strategy_select_and_jump(void)
     if(fw_strategy_perform() == 0)
     {
       //恢复同样要过完整校验：写入返回成功不等于Flash内容正确
-      boot_slot0_ok = (fw_img_verify_full(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
+      boot_slot0_ok = (fw_img_crc32_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
       if(boot_slot0_ok)
       {
         fw_boot_jump_to_app(SLOT0_ADDR);
@@ -267,7 +230,13 @@ void fw_strategy_select_and_jump(void)
     else
     {
       fw_msg_error(FW_MSG_ERR_RECOVER, SLOT1_ADDR);
-      fw_port_flash_erase(SLOT1_ADDR, SLOT_SIZE);
+      /* 恢复可能在动到SLOT1之前就失败（KV写失败、目标页擦除失败），此时SLOT1里的
+         新镜像仍然完好、下次还能再试；只有确认SLOT1确实不可用才擦掉，
+         避免一次瞬态错误把两个槽位一起清空 */
+      if(fw_img_meta_verify(SLOT1_ADDR, SLOT_SIZE, NULL) != FW_IMG_OK)
+      {
+        fw_port_flash_erase(SLOT1_ADDR, SLOT_SIZE);
+      }
     }
   }
 }

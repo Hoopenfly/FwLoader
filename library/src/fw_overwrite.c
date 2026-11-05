@@ -23,8 +23,8 @@ static __attribute__((aligned(FW_FLASH_WRITE_BYTE))) uint8_t boot_page_buf[FW_FL
 void fw_strategy_state_read(void)
 {
   boot_cur_flag = fw_boot_flag_read();
-  boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
-  boot_slot1_ok = fw_boot_image_is_valid(SLOT1_ADDR);
+  boot_slot0_ok = (fw_img_meta_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
+  boot_slot1_ok = (fw_img_meta_verify(SLOT1_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
   fw_msg_boot_state(boot_cur_flag, boot_slot0_ok, boot_slot1_ok);
 }
 
@@ -65,7 +65,7 @@ void fw_strategy_upgrade(void)
     if(fw_strategy_perform() == 0)
     {
       fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED);//覆写成功，置为已确认
-      boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);//重新校验覆写结果
+      boot_slot0_ok = (fw_img_crc32_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;//重新校验覆写结果
       if(boot_slot0_ok)
       {
         fw_boot_jump_to_app(SLOT0_ADDR);//校验通过才跳转
@@ -113,7 +113,7 @@ int fw_strategy_perform(void)
   num_pages = (total_size + FW_FLASH_PAGE_SIZE - 1) / FW_FLASH_PAGE_SIZE;
   fw_msg_update_start(num_pages);
   /* 逐页复制SLOT1到SLOT0，从第0页顺序写入。搬运过程本身不保证中途中断后的完整性，
-   * 完整性由跳转前的fw_img_verify_full()把关：它回读代码算CRC32并与元数据比对，
+   * 完整性由跳转前的fw_img_crc32_verify()把关：它回读代码算CRC32并与元数据比对，
    * 半成品镜像不会被判为有效，也就不会跳转过去。 */
   for(uint32_t page = 0; page < num_pages; page++)
   {

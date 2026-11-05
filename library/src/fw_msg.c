@@ -282,7 +282,7 @@ void fw_msg_jump(uint32_t app_addr)
 /**
 * @brief  打印升级动作开始
 * @param  pages  本次要搬运的页数
-* @note   输出如： Update(overwrite) start: 512 pages
+* @note   输出如： Update(overwrite) start: <pages> pages
 */
 void fw_msg_update_start(uint32_t pages)
 {

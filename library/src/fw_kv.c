@@ -10,6 +10,17 @@
 static volatile fw_kv_log_fn_t fw_kv_log = NULL;
 #define FW_KV_LOG(evt, kv, a, b, c)		do{ if(fw_kv_log != NULL) fw_kv_log((evt), (kv), (kv)->name, (a), (b), (c)); }while(0)
 
+/* ==================== 临界区 ==================== */
+/* 保护方式由平台适配层提供，内核不关心是关中断还是互斥锁(见fw_port.h) */
+#define FW_KV_LOCK()			fw_port_kv_crit_lock()
+#define FW_KV_UNLOCK()			fw_port_kv_crit_unlock()
+
+/* GC时暂存有效记录的缓冲区。
+ * 用文件级静态缓冲而不是实例成员，是为了不让每个KV实例都背上这块RAM开销。
+ * 多实例场景下安全的前提是GC全程在FW_KV_LOCK()保护内执行，同一时刻只会有一个
+ * 实例使用这块缓冲，因此不需要按实例隔离。 */
+static uint8_t gc_buf[FW_KV_GC_BUF_SIZE];
+
 /**
 * @brief  注册日志回调
 * @param  fn  回调函数，传NULL取消注册
@@ -19,11 +30,6 @@ void fw_kv_set_log(fw_kv_log_fn_t fn)
 {
 	fw_kv_log = fn;
 }
-
-/* ==================== 临界区 ==================== */
-/* 保护方式由平台适配层提供，内核不关心是关中断还是互斥锁(见fw_port.h) */
-#define FW_KV_LOCK()			fw_port_kv_crit_lock()
-#define FW_KV_UNLOCK()			fw_port_kv_crit_unlock()
 
 //扇区头结构，固定16字节
 typedef struct
@@ -58,12 +64,6 @@ typedef struct
 FW_STATIC_ASSERT(sizeof(wl_sector_hdr_t) == 16, "wl_sector_hdr_t must be 16 bytes");
 FW_STATIC_ASSERT(sizeof(wl_node_hdr_t) == 16, "wl_node_hdr_t must be 16 bytes");
 FW_STATIC_ASSERT(offsetof(wl_node_hdr_t, status) == 12, "wl_node_hdr_t.status must be at offset 12");
-
-/* GC时暂存有效记录的缓冲区。
- * 用文件级静态缓冲而不是实例成员，是为了不让每个KV实例都背上这块RAM开销。
- * 多实例场景下安全的前提是GC全程在FW_KV_LOCK()保护内执行，同一时刻只会有一个
- * 实例使用这块缓冲，因此不需要按实例隔离。 */
-static uint8_t gc_buf[FW_KV_GC_BUF_SIZE];
 
 /* 常驻key映射(key→最新记录位置)位于实例内(见fw_kv.h的fw_kv_t.key_map)：
  * get与GC均直接查询该映射，不逐条遍历整个分区。 */
@@ -425,17 +425,23 @@ static uint32_t fw_kv_sector_scan_used(fw_kv_t *kv, uint32_t sec_index)
 static int fw_kv_sector_tail_appendable(fw_kv_t *kv, uint32_t sec_index, uint32_t offset)
 {
   uint32_t word = FW_ERASED_WORD;
+  uint32_t shift;
+  uint32_t mask;
 
   if(offset + sizeof(uint32_t) > kv->sector_size)
   {
-    return 0;//没有空间可追加
+    return 0;//剩余不足一个字，放不下任何记录，按已满处理
   }
+  /* offset不保证4字节对齐(记录长度是16+值长+4)：读出所在整字后，
+     把offset之前的字节掩掉再判，否则上一条记录的尾字节会被误当成尾部落了数据 */
+  shift = (offset & (uint32_t)(sizeof(uint32_t) - 1U)) * 8U;
+  mask = 0xFFFFFFFFu << shift;
   if(kv->ops.read(fw_kv_sector_addr(kv, sec_index) + (offset & ~(uint32_t)3U),
           (uint8_t *)&word, sizeof(word)) != 0)
   {
     return 0;
   }
-  return (word == FW_ERASED_WORD) ? 1 : 0;
+  return ((word & mask) == (FW_ERASED_WORD & mask)) ? 1 : 0;
 }
 
 /**
@@ -826,7 +832,10 @@ static int fw_kv_gc_stage_sector(fw_kv_t *kv, uint32_t sec_index, uint32_t sec_s
     if(offset + rec_len > end) break;
     if(!fw_kv_node_crc_ok(kv, sec_index, offset, &hdr)) break;
 
-    if(hdr.status == FW_KV_NODE_VALID)
+    /*DELETED墓碑记录的是"这个key已被删除"这一最新状态，必须和VALID一起搬走：
+      只搬VALID的话，擦掉victim后更早扇区里的同名有效记录会在映射重建时变成最新，
+      已删除的键就复活了。墓碑的value_len为0，只有节点头加CRC的长度*/
+    if(hdr.status == FW_KV_NODE_VALID || hdr.status == FW_KV_NODE_DELETED)
     {
       if(fast_path)
       {
@@ -894,7 +903,8 @@ static int fw_kv_gc_stream_sector(fw_kv_t *kv, uint32_t src, uint32_t src_seq, i
     if(offset + rec_len > end) break;
     if(!fw_kv_node_crc_ok(kv, src, offset, &hdr)) break;
 
-    if(hdr.status == FW_KV_NODE_VALID)
+    /*墓碑同样代表某个key的最新状态，理由见fw_kv_gc_stage_sector里的说明*/
+    if(hdr.status == FW_KV_NODE_VALID || hdr.status == FW_KV_NODE_DELETED)
     {
       if(fast_path)
       {
@@ -1038,8 +1048,14 @@ static int fw_kv_gc_collect(fw_kv_t *kv)
     {
       return FW_KV_ERR_FLASH;
     }
+    /* 扇区头一旦落盘，这个序号就算用掉了：先推进next_seq，搬迁中途失败或掉电
+     * 也只会留下一个待回收的残扇区，不会让下一次GC再写出同序号的目标扇区 */
+    kv->next_seq = new_seq + 1;
     if(fw_kv_gc_stream_sector(kv, (uint32_t)victim, victim_seq, fast_path, (uint32_t)dest, &dest_used) != FW_KV_OK)
     {
+      /* 搬迁没完成：擦掉刚写的扇区头，让dest恢复为空扇区。
+       * 不擦的话init按最大seq会选中这个只有部分记录的扇区，victim里还没搬的键会丢 */
+      (void)fw_kv_sector_erase(kv, (uint32_t)dest);
       return FW_KV_ERR_NOSPC;
     }
   }
@@ -1047,7 +1063,6 @@ static int fw_kv_gc_collect(fw_kv_t *kv)
   /* 3. 确认目标扇区数据完整后才擦除原扇区(擦除失败也不丢数据：目标已有完整副本)。
    *    擦除后不补写扇区头，使其保持整体擦除的空扇区状态作为备用扇区：
    *    下次GC直接以其为搬迁目标，无需再擦除(省一半擦除次数) */
-  kv->next_seq = new_seq + 1;
   if(victim != dest)
   {
     (void)fw_kv_sector_erase(kv, (uint32_t)victim);
@@ -1479,10 +1494,16 @@ static int fw_kv_ensure_space(fw_kv_t *kv, uint32_t rec_len)
     return FW_KV_OK;
   }
 
-  /* 放得下但剩余空间低于GC阈值：主动提前GC（尽力而为，失败也继续追加） */
+  /* 放得下但剩余空间低于GC阈值：主动提前GC（尽力而为，失败也继续追加）。
+     GC会把活动扇区换成另一个扇区，新的已用长度可能比原来更大，
+     所以GC之后要按新的kv->used重新判断这条记录放不放得下 */
   if((kv->sector_size - kv->used) <= gc_watermark)
   {
-    (void)fw_kv_sector_activate_next(kv);  //提前触发GC，忽略失败
+    (void)fw_kv_sector_activate_next(kv);  //提前触发GC；失败时活动扇区不变
+    if((kv->used + rec_len) > kv->sector_size)
+    {
+      return FW_KV_ERR_NOSPC;
+    }
   }
 
   return FW_KV_OK;

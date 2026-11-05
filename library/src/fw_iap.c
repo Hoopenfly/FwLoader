@@ -39,6 +39,14 @@ static int fw_iap_commit_upgrade(uint32_t image_len)
   {
     return -1;
   }
+#if (FW_BOOT_UPGRADE_MODE == 1)
+  /* 交换模式只有进度为NONE时才执行新交换；上一次回滚留下的ROLLED_BACK
+     会让新镜像停在SLOT1不被换入SLOT0，提交时一并清掉 */
+  if(fw_boot_progress_write(FW_SWAP_PROGRESS_NONE) != 0)
+  {
+    return -1;
+  }
+#endif
   fw_msg_iap_done(image_len);
   return 0;
 }
@@ -226,7 +234,7 @@ static uint8_t fw_iap_start_common(const uint8_t *data, uint32_t len)
     return FW_IAP_HEX_ST_SIZE;
   }
   //水印：项目标识不符的镜像不属于本机
-  if(fw_img_meta_project_ok(&cache.info) != 0)
+  if(fw_img_project_verify(&cache.info) != FW_IMG_OK)
   {
     return FW_IAP_HEX_ST_HW_MISMATCH;
   }
@@ -234,7 +242,7 @@ static uint8_t fw_iap_start_common(const uint8_t *data, uint32_t len)
    * 设备回滚到低版本后运行版本随之降低，试图刷到低于当前运行版本的行为会被拒绝。 */
   if((fw_img_locate(fw_iap_old_slot(), SLOT_SIZE, &cur_meta) == FW_IMG_OK) &&
      (cur_meta.image_ver != 0u) &&
-     (cache.info.image_ver < cur_meta.image_ver))
+     (fw_img_ver_verify(cache.info.image_ver, cur_meta.image_ver) != FW_IMG_OK))
   {
     return FW_IAP_HEX_ST_VERSION_OLD;
   }
@@ -441,7 +449,7 @@ static void fw_iap_hex_start_delta(const uint8_t *data, uint16_t len)
 static void fw_iap_hex_finish(void)
 {
   //向量表：栈顶落在RAM、复位向量落在Flash
-  if(!fw_boot_image_is_valid(cache.write_addr))
+  if(fw_img_vectors_ok(cache.write_addr) != FW_IMG_OK)
   {
     fw_iap_hex_fail(FW_IAP_HEX_ST_IMAGE_INVALID);
     return;
@@ -459,7 +467,7 @@ static void fw_iap_hex_finish(void)
     return;
   }
   //从Flash重新定位并校验镜像元数据，确认落盘内容可读且水印正确
-  if(fw_img_verify(cache.write_addr, SLOT_SIZE, NULL) != FW_IMG_OK)
+  if(fw_img_meta_verify(cache.write_addr, SLOT_SIZE, NULL) != FW_IMG_OK)
   {
     fw_iap_hex_fail(FW_IAP_HEX_ST_IMAGE_INVALID);
     return;
@@ -501,7 +509,7 @@ static void fw_iap_hex_delta_finish(void)
     return;
   }
   //从Flash重新定位并校验镜像元数据
-  if(fw_img_verify(cache.write_addr, SLOT_SIZE, NULL) != FW_IMG_OK)
+  if(fw_img_meta_verify(cache.write_addr, SLOT_SIZE, NULL) != FW_IMG_OK)
   {
     fw_iap_hex_fail(FW_IAP_HEX_ST_IMAGE_INVALID);
     return;
@@ -594,7 +602,7 @@ static void fw_iap_hex_data(uint32_t offset, const uint8_t *data, uint16_t len)
     return;
   }
   //首帧落盘后确认向量表可用，尽早区分传输错误与镜像错误
-  if(offset == 0u && !fw_boot_image_is_valid(cache.write_addr))
+  if(offset == 0u && fw_img_vectors_ok(cache.write_addr) != FW_IMG_OK)
   {
     fw_iap_hex_fail(FW_IAP_HEX_ST_IMAGE_INVALID);
     return;

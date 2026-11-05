@@ -29,7 +29,7 @@ static __attribute__((aligned(FW_FLASH_WRITE_BYTE))) uint8_t boot_page_buf[FW_FL
 
 /**
 * @brief   读取交换进度
-* @return  FW_SWAP_PROGRESS_NONE表示未开始，1-512表示已完成页数
+* @return  FW_SWAP_PROGRESS_NONE表示未开始，1..总页数表示已完成页数
 */
 static uint32_t fw_swap_progress_read(void)
 {
@@ -38,7 +38,7 @@ static uint32_t fw_swap_progress_read(void)
 
 /**
 * @brief   写入交换进度
-* @param   progress    FW_SWAP_PROGRESS_NONE或已完成页数（1-512）
+* @param   progress    FW_SWAP_PROGRESS_NONE或已完成页数（1..总页数）
 * @return  0表示成功
 */
 static int fw_swap_progress_write(uint32_t progress)
@@ -47,18 +47,35 @@ static int fw_swap_progress_write(uint32_t progress)
 }
 
 /**
-* @brief   计算交换模式需要交换的页数（依据镜像元数据里的image_len）
+* @brief   计算交换模式需要交换的页数
 * @return  需要交换的页数
-* @note    元数据定位失败或长度非法时，回退到整个SLOT的页数
+* @note    SLOT0是旧镜像、SLOT1是新镜像，两者都要完整搬移，故按各自的image_len取较大者；
+*          只按其中一个计算会让另一个槽位的尾部不被交换。都定位不到时回退到整个SLOT的页数
 */
 static uint32_t fw_swap_num_pages(void)
 {
-  uint32_t total_size = SLOT_SIZE;
+  uint32_t slot0_size = 0u;
+  uint32_t slot1_size = 0u;
+  uint32_t total_size;
   fw_img_meta_t meta;
+  //SLOT0中旧镜像的长度
   if((fw_img_locate(SLOT0_ADDR, SLOT_SIZE, &meta) == FW_IMG_OK) &&
      (meta.image_len > 0u) && (meta.image_len <= SLOT_SIZE))
   {
-    total_size = meta.image_len;
+    slot0_size = meta.image_len;
+  }
+  //SLOT1中新镜像的长度
+  if((fw_img_locate(SLOT1_ADDR, SLOT_SIZE, &meta) == FW_IMG_OK) &&
+     (meta.image_len > 0u) && (meta.image_len <= SLOT_SIZE))
+  {
+    slot1_size = meta.image_len;
+  }
+  //取较大者：保证新镜像完整落到SLOT0，旧镜像备份完整落到SLOT1
+  total_size = (slot0_size > slot1_size) ? slot0_size : slot1_size;
+  //两个槽位都没有可用镜像时按整个槽位计算
+  if(total_size == 0u)
+  {
+    total_size = SLOT_SIZE;
   }
   return(total_size + FW_FLASH_PAGE_SIZE - 1) / FW_FLASH_PAGE_SIZE;
 }
@@ -256,7 +273,8 @@ static int fw_swap_copy_scratch_to_slot0(uint32_t page)
 static int fw_swap_recover(void)
 {
   uint32_t progress = fw_swap_progress_read();
-  if(progress == FW_SWAP_PROGRESS_NONE || progress == FW_SWAP_PROGRESS_COMPLETE)
+  if(progress == FW_SWAP_PROGRESS_NONE || progress == FW_SWAP_PROGRESS_COMPLETE ||
+     progress == FW_SWAP_PROGRESS_ROLLED_BACK)
   {
     return 0;
   }
@@ -302,7 +320,14 @@ static int fw_swap_recover(void)
     }
     else
     {
-      //异常情况：重做完整交换
+      /*当前页第2步写到一半：SLOT0既不是暂存、也不是完整的SLOT1，说明上次写该页时
+        掉电或出错，页内只有部分字节被编程。暂存里的旧页是完整的(能加载出来说明
+        CRC已通过)，先用它把SLOT0还原再重做完整交换；否则下面的copy_slot0_to_scratch()
+        会把这份唯一的旧固件备份覆盖成半写页，回滚源就没了*/
+      if(fw_swap_copy_scratch_to_slot0(page) != 0)
+      {
+        return -1;
+      }
       do_full = 1;
     }
     if(do_full)
@@ -347,19 +372,20 @@ static int fw_swap_recover(void)
 void fw_strategy_state_read(void)
 {
   boot_cur_flag = fw_boot_flag_read();
-  boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
-  boot_slot1_ok = fw_boot_image_is_valid(SLOT1_ADDR);
+  boot_slot0_ok = (fw_img_meta_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
+  boot_slot1_ok = (fw_img_meta_verify(SLOT1_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
   fw_msg_boot_state(boot_cur_flag, boot_slot0_ok, boot_slot1_ok);
 }
 
 /**
 * @brief   恢复被中断的交换
-* @note    进度采用已完成页数编码(取值1-512)；恢复成功后SLOT0已是新固件，直接跳转
+* @note    进度采用已完成页数编码(取值1..总页数)；恢复成功后SLOT0已是新固件，直接跳转
 */
 void fw_strategy_recover(void)
 {
   uint32_t progress = fw_swap_progress_read();
-  if(progress == FW_SWAP_PROGRESS_NONE || progress == FW_SWAP_PROGRESS_COMPLETE)
+  if(progress == FW_SWAP_PROGRESS_NONE || progress == FW_SWAP_PROGRESS_COMPLETE ||
+     progress == FW_SWAP_PROGRESS_ROLLED_BACK)
   {
     return;
   }
@@ -367,7 +393,9 @@ void fw_strategy_recover(void)
   if(fw_swap_recover() == 0)
   {
     fw_msg_recover_done();
-    boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
+    /* 恢复只保证"页都搬完了"，不保证Flash内容真的对：跳转前按与阶段2一致的标准
+       做一次完整校验(回读代码区重算CRC32)，不通过就不跳，交给阶段3处理 */
+    boot_slot0_ok = (fw_img_crc32_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
     if(boot_slot0_ok)
     {
       //恢复完成，SLOT0已为新固件，直接跳转(跳过阶段2/3)
@@ -393,15 +421,36 @@ void fw_strategy_rollback_flag(void)
     return;
   }
   fw_msg_rollback_start();
-  if(fw_strategy_rollback() == 0)
+  /*进度已是ROLLED_BACK说明回滚交换已经做完，只是标志没写成CONFIRMED就断电了。
+    这里只补写标志，不再交换一次，否则会把刚回滚好的SLOT0又换成待回滚的固件*/
+  if(fw_swap_progress_read() == FW_SWAP_PROGRESS_ROLLED_BACK)
   {
-    //回滚完成，置为已确认；写失败会导致下次启动重复回滚，记一条错误便于定位
-    if(fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED) != 0)
+    if(fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED) == 0)
+    {
+      fw_boot_progress_write(FW_SWAP_PROGRESS_NONE);
+      fw_msg_rollback_done();
+    }
+    else
     {
       fw_msg_error(FW_MSG_ERR_UPDATE, FW_BOOT_FLAG_CONFIRMED);
     }
-    boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);   //又交换了一轮，两个槽位都要重新校验
-    boot_slot1_ok = fw_boot_image_is_valid(SLOT1_ADDR);
+    boot_cur_flag = fw_boot_flag_read();
+    return;
+  }
+  if(fw_strategy_rollback() == 0)
+  {
+    //回滚完成，置为已确认；写失败会导致下次启动重复回滚，记一条错误便于定位
+    if(fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED) == 0)
+    {
+      //确认标志落盘后才清除回滚完成标记，两者顺序反了会让下次启动再回滚一次
+      fw_boot_progress_write(FW_SWAP_PROGRESS_NONE);
+    }
+    else
+    {
+      fw_msg_error(FW_MSG_ERR_UPDATE, FW_BOOT_FLAG_CONFIRMED);
+    }
+    boot_slot0_ok = (fw_img_meta_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;   //又交换了一轮，两个槽位都要重新校验
+    boot_slot1_ok = (fw_img_meta_verify(SLOT1_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
     fw_msg_rollback_done();
   }
   else
@@ -432,8 +481,9 @@ void fw_strategy_upgrade(void)
     {
       if(fw_strategy_perform() == 0)
       {
-        //升级成功(进度已设为COMPLETE)，直接跳转到新固件
-        boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
+        /*升级成功(进度已设为COMPLETE)：跳转前与阶段2同样做完整校验，
+          交换过程写坏一页也能被挡住，交给阶段3回滚*/
+        boot_slot0_ok = (fw_img_crc32_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
         if(boot_slot0_ok)
         {
           fw_boot_jump_to_app(SLOT0_ADDR);
@@ -471,8 +521,8 @@ void fw_strategy_unconfirmed(void)
     {
       fw_msg_rollback_done();
       fw_boot_flag_write(FW_BOOT_FLAG_NONE);
-      boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
-      boot_slot1_ok = fw_boot_image_is_valid(SLOT1_ADDR);
+      boot_slot0_ok = (fw_img_meta_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
+      boot_slot1_ok = (fw_img_meta_verify(SLOT1_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
       boot_cur_flag = fw_boot_flag_read();
     }
     else
@@ -542,9 +592,10 @@ int fw_strategy_rollback(void)
     int ret = fw_strategy_perform();
     if(ret == 0)
     {
-      /*回滚完成后重置进度为NONE（清除COMPLETE状态）。这一步写失败时必须上报：
-        残留的COMPLETE标志会让下次启动误判交换未完成并重复执行恢复流程*/
-      if(fw_swap_progress_write(FW_SWAP_PROGRESS_NONE) != 0)
+      /*回滚完成后写ROLLED_BACK而不是NONE：NONE会被掉电重启后的强制回滚流程
+        当成"还没回滚"，再交换一次把刚换回来的旧固件又换成新固件。
+        该标记由调用方写CONFIRMED成功后再清成NONE*/
+      if(fw_swap_progress_write(FW_SWAP_PROGRESS_ROLLED_BACK) != 0)
       {
         return -1;
       }

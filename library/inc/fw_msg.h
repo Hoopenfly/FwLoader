@@ -85,7 +85,7 @@ extern "C" {
 #define FW_MSG_IS_ON(item)       ((FW_MSG_ENABLE != 0) && ((item) != 0))
 
 //FwLoader库版本：由库维护者随发布更新，不使用#ifndef，避免被使用方无意覆盖
-#define FW_LIB_VERSION      "2.0.0"
+#define FW_LIB_VERSION      "2.0.1"
 
 /* 错误码：日志"err 0xNN <描述>"与该枚举一一对应 */
 typedef enum

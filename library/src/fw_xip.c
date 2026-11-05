@@ -9,9 +9,19 @@
 #include <string.h>
 #include "fw_msg.h"
 #include "fw_kv.h"
+#include "fw_img.h"
 
 //这两个查询不带FW_BOOT_BUILD_LOADER条件：App构建(模式2)下fw_boot_set_confirmed()也要用
 #if (FW_BOOT_UPGRADE_MODE == 2)
+
+#if (FW_BOOT_BUILD_LOADER == 0)
+//XIP运行状态(由fw_strategy_state_read填写)
+//初值取"未初始化"而不是0：0恰好等于SLOT0，会让漏调state_read的路径静默按SLOT0运行
+#define FW_XIP_RUN_SLOT_UNKNOWN  0xFFFFFFFFu
+static uint32_t boot_run_slot = FW_XIP_RUN_SLOT_UNKNOWN;   //当前运行槽位
+static int      boot_cur_ok;     //当前运行槽位是否有有效镜像
+static int      boot_other_ok;   //对侧槽位是否有有效镜像
+#endif
 
 /**
 * @brief   获取XIP模式当前运行槽位
@@ -34,13 +44,6 @@ uint32_t fw_xip_get_run_slot(void)
 #endif /* FW_BOOT_UPGRADE_MODE == 2 */
 
 #if (FW_BOOT_BUILD_LOADER == 0) && (FW_BOOT_UPGRADE_MODE == 2)
-
-//XIP运行状态(由fw_strategy_state_read填写)
-//初值取"未初始化"而不是0：0恰好等于SLOT0，会让漏调state_read的路径静默按SLOT0运行
-#define FW_XIP_RUN_SLOT_UNKNOWN  0xFFFFFFFFu
-static uint32_t boot_run_slot = FW_XIP_RUN_SLOT_UNKNOWN;   //当前运行槽位
-static int      boot_cur_ok;     //当前运行槽位是否有有效镜像
-static int      boot_other_ok;   //对侧槽位是否有有效镜像
 
 /**
 * @brief   检测XIP模式是否处于"待App确认"状态（CONFIRM_BIT已置位）
@@ -78,8 +81,8 @@ static uint32_t fw_xip_get_upgrade_target_address(void)
 void fw_strategy_state_read(void)
 {
   boot_cur_flag = fw_boot_flag_read();
-  boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
-  boot_slot1_ok = fw_boot_image_is_valid(SLOT1_ADDR);
+  boot_slot0_ok = (fw_img_meta_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
+  boot_slot1_ok = (fw_img_meta_verify(SLOT1_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
   fw_msg_boot_state(boot_cur_flag, boot_slot0_ok, boot_slot1_ok);
   boot_run_slot = fw_xip_get_run_slot();
   boot_cur_ok = (boot_run_slot == FW_XIP_RUN_SLOT0) ? boot_slot0_ok : boot_slot1_ok;
@@ -114,8 +117,8 @@ void fw_strategy_rollback_flag(void)
     }
     boot_run_slot = fw_xip_get_run_slot();     //读回滚之后的运行槽位
     boot_cur_ok = 1;                        //刚切过去的槽位必定有效
-    boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
-    boot_slot1_ok = fw_boot_image_is_valid(SLOT1_ADDR);
+    boot_slot0_ok = (fw_img_meta_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
+    boot_slot1_ok = (fw_img_meta_verify(SLOT1_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
     fw_msg_rollback_done();
   }
   else
@@ -143,7 +146,7 @@ void fw_strategy_upgrade(void)
   if(!fw_xip_is_pending_confirm())
   {
     uint32_t target_addr = fw_xip_get_upgrade_target_address();
-    if(fw_boot_image_is_valid(target_addr))
+    if(fw_img_crc32_verify(target_addr, SLOT_SIZE, NULL) == FW_IMG_OK)
     {
       if(fw_strategy_perform() == 0)
       {
@@ -186,8 +189,8 @@ void fw_strategy_unconfirmed(void)
       fw_boot_flag_write(FW_BOOT_FLAG_NONE);
       boot_run_slot = fw_xip_get_run_slot();
       boot_cur_ok = 1;
-      boot_slot0_ok = fw_boot_image_is_valid(SLOT0_ADDR);
-      boot_slot1_ok = fw_boot_image_is_valid(SLOT1_ADDR);
+      boot_slot0_ok = (fw_img_meta_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
+      boot_slot1_ok = (fw_img_meta_verify(SLOT1_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;
       boot_cur_flag = fw_boot_flag_read();
     }
     else
@@ -209,7 +212,9 @@ void fw_strategy_unconfirmed(void)
 void fw_strategy_select_and_jump(void)
 {
   uint32_t run_addr = (boot_run_slot == FW_XIP_RUN_SLOT0) ? SLOT0_ADDR : SLOT1_ADDR;
-  if(boot_cur_ok)
+  /*跳转前完整校验：向量表有效只说明栈顶与复位向量对，代码区可能因写入出错或内容
+    损坏而不可用；与模式0/1保持同一标准*/
+  if(boot_cur_ok && (fw_img_crc32_verify(run_addr, SLOT_SIZE, NULL) == FW_IMG_OK))
   {
     fw_boot_jump_to_app(run_addr);
   }
@@ -218,6 +223,11 @@ void fw_strategy_select_and_jump(void)
   {
     uint32_t fallback_addr = (boot_run_slot == FW_XIP_RUN_SLOT0) ? SLOT1_ADDR : SLOT0_ADDR;
     uint32_t new_slot = (boot_run_slot == FW_XIP_RUN_SLOT0) ? FW_XIP_RUN_SLOT1 : FW_XIP_RUN_SLOT0;
+    //对侧同样要过完整校验，不完整就不跳，避免把两个槽来回试成死循环
+    if(fw_img_crc32_verify(fallback_addr, SLOT_SIZE, NULL) != FW_IMG_OK)
+    {
+      return;
+    }
     //切槽写失败不阻止本次跳转(对侧镜像是好的)，但要留下记录：否则每次上电都会重复走兜底
     if(fw_xip_set_run_slot(new_slot) != 0)
     {
@@ -263,8 +273,8 @@ int fw_strategy_rollback(void)
     target_slot = FW_XIP_RUN_SLOT0;
     target_addr = SLOT0_ADDR;
   }
-  //验证目标槽位镜像是否有效
-  if(!fw_boot_image_is_valid(target_addr))
+  //回滚只查元数据级有效：切槽后主流程必定再走select_and_jump，那里会做完整校验
+  if(fw_img_meta_verify(target_addr, SLOT_SIZE, NULL) != FW_IMG_OK)
   {
     return -1;
   }
