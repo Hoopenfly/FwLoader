@@ -17,14 +17,10 @@
 
 ```
 <仓库根>/
-    00.BootLoader-V1.0.3/              BootLoader 工程（Keil MDK），库副本在 ThirdParty/FwLoader/
-    01.App-V1.0.3/                     App 工程（Keil MDK），库副本在 ThirdParty/FwLoader/
-
-FwLoader/                              库与上位机工具所在目录
     README.md
     LICENSE                            MIT
     .gitignore
-    library/                           库本体（主副本，改动从这里开始）
+    library/                           库本体
         inc/                           对外头文件
             fw_kv.h                    KV 存储内核
             fw_cfg.h                   全部配置：库内核参数、器件能力、板级布局
@@ -60,7 +56,7 @@ FwLoader/                              库与上位机工具所在目录
             res/                       应用图标与 qrc
 ```
 
-库在本仓库里存有三份：`FwLoader/library` 是主副本，两个工程各自在 `ThirdParty/FwLoader` 下带一份同源副本。修改库时先改主副本，再把 `src/` 与 `inc/` 下改动过的文件同步到两个工程，三份内容必须逐字节一致；两个工程编译时用的是各自 `ThirdParty/FwLoader` 下那一份，不同步就会出现"README 描述的是新行为、固件跑的是旧行为"。
+库以源码形式集成到具体工程：把 `library/` 整个目录拷进工程（目录名与放置位置由工程决定，常见约定如 `ThirdParty/FwLoader/`），工程编译 `library/src/` 下的源文件，并把 `library/inc/` 加入头文件搜索路径。本文其余部分出现的 `library/xxx` 都是库内相对路径，实际工程里对应的是拷贝后的那一份。库本身不依赖工程名、目录名或具体芯片型号。
 
 全部配置集中在 `library/inc/fw_cfg.h`（库内核参数 / 器件能力 / 板级布局三节）；平台实现（Flash与EEPROM读写擦、串口收发与取帧、调试输出、中断开关、跳转、复位原因、断言动作、临界区）放在 `library/src/fw_port.c`；库内其它文件不使用平台头文件与寄存器，只调用 `fw_port` 的抽象接口。平台后端与使用方工具不属于本库，由工程提供。
 
@@ -186,7 +182,7 @@ fw_kv_set(&kv, FW_KV_KEY_BOOT_FLAG, (const uint8_t *)&flag, sizeof(flag));
 
 ### 2.1 Flash 布局
 
-分区顺序固定，具体地址与大小由 `library/inc/fw_cfg.h` 定义；[第十一章](#十一示例配置)给出的数值仅用于说明结构，不代表本工程实际配置。
+分区顺序固定，具体地址与大小由 `library/inc/fw_cfg.h` 定义；[第十一章](#十一示例配置)给出的数值仅用于说明结构，换成实际工程时必须按器件对应的 Flash 与 EEPROM 重新填写。
 
 | 区域 | 位置 | 用途 |
 |---|---|---|
@@ -206,7 +202,7 @@ fw_kv_set(&kv, FW_KV_KEY_BOOT_FLAG, (const uint8_t *)&flag, sizeof(flag));
 | `1` 交换 | `library/src/fw_swap.c` | SLOT0 与 SLOT1 逐页交换，用 STAGE 的 KV 做单页暂存与进度记录；**交换页数按两个槽位镜像长度的较大者计算**（两者各自从镜像元数据取 `image_len`，仅当两侧都取不到时才退回整个槽位） | 支持 |
 | `2` 就地执行 | `library/src/fw_xip.c` | 两个槽位各自就地执行，只切换运行槽位与 confirm 位 | 支持 |
 
-模式 2 要求两个槽位能各自就地执行，即器件为双 Bank Flash，或把两份固件分别链接到不同的 IROM 起址。本工程使用的 STM32L071 是单 Bank 器件，两个槽位无法同时就地执行，因此模式 2 在本芯片上不可用，工程按模式 0 构建；`FW_BOOT_UPGRADE_MODE` 取 2 时库能编译，但在本芯片上没有可跳转的第二个执行区。
+模式 2 要求两个槽位能各自就地执行，即器件为双 Bank Flash，或把两份固件分别链接到不同的 IROM 起址。单 Bank 器件（例如 STM32L071）的两个槽位无法同时就地执行，模式 2 在这种器件上不可用；`FW_BOOT_UPGRADE_MODE` 取 2 时库能编译，但没有可跳转的第二个执行区。
 
 **覆写按页顺序写入**：从第 0 页写到最后一页。覆写页数按镜像元数据里的 `image_len` 计算（向上取整到页），只搬镜像实际占用的大小，镜像之外的页不动；耗时与镜像大小和器件编程速度成正比，元数据缺失时退回按整槽计算。中途断电时标志仍是 `VALID`，重启后重新执行覆写；中途写失败时由跳转前的完整校验兜底，见下一条。
 
@@ -453,7 +449,7 @@ iap_state_t fw_iap_get_status(uint32_t *total_size, uint32_t *received_size, uin
 
 | 开关 | 位置 | 取值 |
 |---|---|---|
-| `FW_BOOT_UPGRADE_MODE` | `library/inc/fw_boot.h` | `0` 覆写 / `1` 交换 / `2` 就地执行（模式 2 需双 Bank 或双 IROM 起址，STM32L071 为单 Bank，不可用；本工程取 `0`） |
+| `FW_BOOT_UPGRADE_MODE` | `library/inc/fw_boot.h` | `0` 覆写 / `1` 交换 / `2` 就地执行（模式 2 需双 Bank 或双 IROM 起址，单 Bank 器件如 STM32L071 不可用） |
 | `FW_BOOT_BUILD_LOADER` | 工程选项；`library/inc/fw_boot.h` 内 `#ifndef` 兜底为 `1` | `0` 引导构建 / `1` 应用构建 |
 | `configUSE_FREERTOS` | 工程选项；仅 `library/src/fw_port.c` 内兜底 | `1` 时平台层临界区用 FreeRTOS 互斥锁，`0` 时用关中断 |
 | `FW_ERASED_VALUE` | `library/inc/fw_cfg.h` | `0x00` / `0xFF` |
@@ -611,7 +607,7 @@ typedef enum
 |---|---|---|
 | `0` 覆写 | BootLoader、SLOT0、SLOT1、STAGE | 四段连续，SLOT1 只作为接收缓冲 |
 | `1` 交换 | BootLoader、SLOT0、SLOT1、STAGE | 四段连续，SLOT0 与 SLOT1 大小相同 |
-| `2` 就地执行 | BootLoader、SLOT0、SLOT1、STAGE | 两个槽位需能各自就地执行：双 Bank 器件，或把两份固件编译到不同的 IROM 地址；本工程的 STM32L071 为单 Bank，不满足该条件 |
+| `2` 就地执行 | BootLoader、SLOT0、SLOT1、STAGE | 两个槽位需能各自就地执行：双 Bank 器件，或把两份固件编译到不同的 IROM 地址；单 Bank 器件（如 STM32L071）不满足该条件 |
 
 模式 0 与模式 1 的差别在于是否需要回滚能力；模式 2 不搬运镜像，只切换运行槽位与 confirm 位，但它的升级后跳转、选镜像与对侧兜底同样要过 `fw_img_crc32_verify()`，与模式 0/1 一致；回滚本身只做 `fw_img_meta_verify()`，深度校验交给随后的选镜像流程。
 
