@@ -28,10 +28,10 @@
  * 发行新版本时改这里并重新编译；命令行同名选项可临时覆盖，
  * 供不改代码的场合使用。
  */
-#define META_VER_MAJOR      1       /*镜像版本主号，0~255*/
+#define META_VER_MAJOR      0       /*镜像版本主号，0~255*/
 #define META_VER_MINOR      0       /*镜像版本次号，0~255*/
-#define META_VER_PATCH      3       /*镜像版本修订号，0~255*/
-#define META_PROJECT        1u      /*项目水印，必须与设备端 FW_IMG_PROJECT_ID 一致*/
+#define META_VER_PATCH      0       /*镜像版本修订号，0~255*/
+#define META_PROJECT        0u      /*项目水印，必须与设备端 FW_IMG_PROJECT_ID 一致*/
 #define META_CUSTOMER       0u      /*客户编号，0~65535*/
 #define META_BATCH          0u      /*批次号，0~65535*/
 #define META_BUILD_DATE     0u      /*构建日期，如20261020；取固定值可保证同样源码两次打包一致*/

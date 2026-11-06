@@ -630,14 +630,14 @@ App工程的Keil`After Build`钩子直接调用它：
     ..\..\FwLoader\mkimg\mkimg.exe ".\<输出目录>\<工程>.bin" ".\<输出目录>\<工程>.pkg.bin" --version <x.y.z> --project <N>
 ```
 
-`--version` 必须与 App 的 `FW_VERSION`（`API/sys_param.h`）保持一致：不带该参数时 mkimg 回落到编译期默认值（1.0.3），版本号会低于设备当前运行的镜像，设备按版本单调性回 `0x0A` 拒绝升级。改 `FW_VERSION` 时要同步改这一行。
+`--version` 必须与 App 的 `FW_VERSION`（`API/sys_param.h`）保持一致。不带该参数时，mkimg 用编译期默认值 `0.0.0`，**不会跟随 `FW_VERSION`**；设备端按 `image_ver >= 当前运行版本` 放行，`0.0.0` 对任何正常固件都会被判 `0x0A` 版本过低，所以打包时这个参数不能省。改 `FW_VERSION` 时要同步改这一行。
 
 流程为：`fromelf --bin` 产出纯代码 bin → `mkimg.exe` 在代码末尾追加 64 字节镜像元数据 → 输出 `<工程>.pkg.bin`，即交付烧录的发布包。
 
-镜像版本、项目水印、客户号、批次号、构建日期都在`mkimg.c`顶部的`META_*`宏里配置，改完重新编译`mkimg.exe`即可。临时覆盖用命令行参数：
+镜像版本、项目水印、客户号、批次号、构建日期都可以改 `mkimg.c` 顶部的 `META_*` 宏后重编 `mkimg.exe`，但**这些宏的默认值全为 0 是故意的**：版本 `0.0.0` 会被设备判 `0x0A`，项目水印 `0` 与设备端 `FW_IMG_PROJECT_ID` 不符会被判 `0x08`，漏传参数打出的包上机即失败，不会静默生效。常规做法是在 Keil 的 After Build 命令里显式传参：
 
 ```
-mkimg.exe app.bin app.pkg.bin --version 1.0.4 --project 2 --customer 1 --batch 3
+mkimg.exe app.bin app.pkg.bin --version 1.0.4 --project 1 --customer 1 --batch 3
 ```
 
 重新编译：
