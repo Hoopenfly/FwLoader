@@ -334,13 +334,15 @@ void TransportRunner::runFlash(const QString &newFile, const QString &fwdFile)
   const auto postProgress = [this](int percent) { emit progressChanged(percent); };
 
   //统一收尾：恢复客户端轮询并通知GUI结束忙碌态
-  const auto finish = [this](bool ok, const QString &message, bool linkBroken = false)
+  const auto finish = [this](bool ok, const QString &message,
+                             bool linkBroken = false, bool stoppedWaiting = false)
   {
     if(m_transport && m_transportType == 1 && m_role == 1)    //TCP服务器仍在监听时恢复轮询
     {
       startPollTimer();
     }
-    emit flashFinished(ok, linkBroken, message);
+    emit flashPhaseChanged(0);    //无论哪条路径结束，界面都要把按钮恢复成开始烧录
+    emit flashFinished(ok, linkBroken, stoppedWaiting, message);
   };
 
   if(!m_transport)    //通道可能已被界面关闭
@@ -432,15 +434,19 @@ void TransportRunner::runFlash(const QString &newFile, const QString &fwdFile)
     }
   }
 
+  /* 差分包对应的代码CRC：版本和长度都可能相同而内容不同，
+     必须比对CRC才能确定差分包确实是给这份新固件用的 */
+  const uint32_t codeCrc = code.empty() ? 0u : fw::crc32(code.data(), code.size());
+
   if(useDelta && (pack.meta.image_len < fw::kImgMetaLen
                   || static_cast<uint64_t>(pack.meta.image_len) - fw::kImgMetaLen != code.size()
                   || pack.meta.image_ver != version
-                  || pack.meta.project_id != project))    //长度相同但版本或水印不同的差分包同样不能用
+                  || pack.meta.project_id != project
+                  || pack.meta.code_crc32 != codeCrc))    //长度相同但版本、水印或代码CRC不同的差分包同样不能用
   {
-    postLog(QStringLiteral("差分包与新固件不匹配"));    //避免设备校验失败后才发现
-    postStatus(QStringLiteral("升级失败"));
-    finish(false, QStringLiteral("差分包与新固件不匹配"));
-    return;
+    //差分包与新固件对不上，错的只是发送方式，不该让整个升级中断，改发整包
+    postLog(QStringLiteral("差分包与新固件不匹配，改发整包"));
+    useDelta = false;
   }
 
   //发送前把本次采用的方式明确写给操作者，避免不清楚发的是哪一种
@@ -463,6 +469,8 @@ void TransportRunner::runFlash(const QString &newFile, const QString &fwdFile)
   FirmwareUploader uploader(m_transport.get());    //复用当前通道做分帧发送
   uploader.setCancelCheck([this]() { return clientCancelled(); });    //让上传器能中断长流程
   uploader.setLogSink([this](const QString &line) { emit logText(line); });    //把等待设备处理的节点写进日志
+  //阶段变化要传给界面：末帧发出后设备转入自处理，此时按钮语义变成停止等待
+  uploader.setPhaseSink([this](int phase) { emit flashPhaseChanged(phase); });
 
   bool didDelta = false;    //记录差分是否真正成功
   auto progress = [&](int percent, uint32_t frameCurrent, uint32_t frameTotal)    //发送进度回调，在工作线程执行
@@ -480,30 +488,41 @@ void TransportRunner::runFlash(const QString &newFile, const QString &fwdFile)
     {
       didDelta = true;
     }
-    else if(!result.cancelled && result.ok)    //设备明确拒绝差分才回退整包
+    else if(result.cancelled)
     {
-      postLog(QStringLiteral("差分未成功，设备回复 0x%1：%2，回退整包")
-              .arg(QString::number(result.status, 16).toUpper().rightJustified(2, QChar('0')), iapStatusText(result.status)));
+      //用户在差分阶段取消，交给后面的公共取消分支处理
+    }
+    else if(!result.ok && result.fatal)
+    {
+      //链路已断，回退整包也没有意义
+      postLog(QStringLiteral("差分升级失败: %1").arg(result.error));
+      postStatus(QStringLiteral("升级失败"));
+      finish(false, QStringLiteral("差分升级失败"), true);
+      return;
+    }
+    else if(!result.ok)
+    {
+      //差分通信超时等可恢复失败：与设备拒绝差分一样回退整包，不让一次丢包终止升级
+      postLog(QStringLiteral("差分通信失败: %1，回退整包").arg(result.error));
     }
     else
     {
-      if(!result.ok)
-      {
-        postLog(QStringLiteral("差分升级失败: %1").arg(result.error));
-      }
-      else
-      {
-        postLog(QStringLiteral("差分升级失败，设备回复 0x%1：%2")
-                .arg(QString::number(result.status, 16).toUpper().rightJustified(2, QChar('0')), iapStatusText(result.status)));
-      }
-      postStatus(QStringLiteral("升级失败"));
-      finish(false, QStringLiteral("差分升级失败"), result.fatal);
-      return;
+      //设备明确拒绝差分（0x0E基版本不符、0x0F格式错误、0x10不支持等）
+      postLog(QStringLiteral("差分未成功，设备回复 0x%1：%2，回退整包")
+              .arg(QString::number(result.status, 16).toUpper().rightJustified(2, QChar('0')), iapStatusText(result.status)));
     }
   }
 
   if(result.cancelled)    //用户在差分阶段取消
   {
+    if(result.waitingDevice)    //末帧已发出，设备转入自行重建并提交，撤不回了
+    {
+      //差分包只有一帧时，点下开始不到一秒数据就全部到达，之后的时间都在等设备
+      postLog(QStringLiteral("已停止等待：设备仍在重建镜像并提交，此间不要断电，完成后复位确认版本"));
+      postStatus(QStringLiteral("设备处理中"));
+      finish(false, QStringLiteral("设备处理中"), false, true);
+      return;
+    }
     postLog(QStringLiteral("已取消升级"));
     postStatus(QStringLiteral("已取消"));
     finish(false, QStringLiteral("已取消"));
@@ -516,7 +535,9 @@ void TransportRunner::runFlash(const QString &newFile, const QString &fwdFile)
     postLog(QStringLiteral("整包升级: %1 字节，总帧数：%2")
             .arg(static_cast<qint64>(code.size()))
             .arg(totalFrames));
-    fw::ImageMeta meta;    //整包镜像元数据
+    //整包镜像元数据沿用固件自带的那份：客户编号、批次、构建日期等字段不能因
+    //重新默认构造而被清零，否则设备侧读到的元数据与发布包里登记的不一致
+    fw::ImageMeta meta = embedded;
     meta.image_ver = version;    //版本号在启动时已编码
     meta.project_id = project;    //项目水印
     result = uploader.sendFull(code, meta, progress);    //下发完整镜像
@@ -524,6 +545,13 @@ void TransportRunner::runFlash(const QString &newFile, const QString &fwdFile)
 
   if(result.cancelled)    //用户在整包阶段取消
   {
+    if(result.waitingDevice)    //末帧已发出，设备正在写元数据并提交标志
+    {
+      postLog(QStringLiteral("已停止等待：设备仍在提交本次升级，此间不要断电，完成后复位确认版本"));
+      postStatus(QStringLiteral("设备处理中"));
+      finish(false, QStringLiteral("设备处理中"), false, true);
+      return;
+    }
     postLog(QStringLiteral("已取消升级"));
     postStatus(QStringLiteral("已取消"));
     finish(false, QStringLiteral("已取消"));

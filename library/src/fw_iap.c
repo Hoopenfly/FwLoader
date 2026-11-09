@@ -17,8 +17,14 @@
   #error "FW_PORT_RX_BUF_SIZE is too small for IAP frames"
 #endif
 
+//临时诊断标记：升级收尾卡死时用JLink读该变量定位停在哪一步
+
 //IAP响应接口：发送经平台适配层，本模块不直接调用平台串口函数
 #define FW_IAP_SEND(buf, len)  fw_port_send_buf((const uint8_t *)(buf), (uint16_t)(len))
+
+/* 差分记录流的宽松上界：整条流全按LITERAL编码时开销约1.03倍代码长度，
+   取2倍槽位只用于挡住明显异常的声明，避免进度百分比被无意义缩小 */
+#define FW_IAP_DELTA_MAX_STREAM  ((uint32_t)SLOT_SIZE * 2u)
 
 //IAP接收状态缓存：镜像元数据在START帧收到后缓存在这里，收满后写Flash末尾
 static iap_page_cache_t cache = {0};
@@ -35,18 +41,20 @@ static int fw_iap_commit_upgrade(uint32_t image_len)
   {
     return -1;//未接收到有效数据
   }
-  if(fw_boot_flag_write(FW_BOOT_FLAG_VALID) != 0)
-  {
-    return -1;
-  }
 #if (FW_BOOT_UPGRADE_MODE == 1)
   /* 交换模式只有进度为NONE时才执行新交换；上一次回滚留下的ROLLED_BACK
-     会让新镜像停在SLOT1不被换入SLOT0，提交时一并清掉 */
+     会让新镜像停在SLOT1不被换入SLOT0，提交时一并清掉。
+     必须先清进度再置VALID：两次KV写之间掉电时，若已置VALID而进度仍是旧值，
+     BL会按"交换被中断"处理，可能把刚提交的镜像回滚；反序最坏只丢一次进度记录 */
   if(fw_boot_progress_write(FW_SWAP_PROGRESS_NONE) != 0)
   {
     return -1;
   }
 #endif
+  if(fw_boot_flag_write(FW_BOOT_FLAG_VALID) != 0)
+  {
+    return -1;
+  }
   fw_msg_iap_done(image_len);
   return 0;
 }
@@ -181,7 +189,11 @@ static int fw_iap_meta_write(void)
     }
     if(fw_port_flash_write(p, page, FW_FLASH_PAGE_SIZE) != 0)
     {
-      return -1;
+      //写回失败时重试一次：缓存页还在，重试不需要重新读回
+      if(fw_port_flash_write(p, page, FW_FLASH_PAGE_SIZE) != 0)
+      {
+        return -1;//该页已擦除，调用方据此上报失败，由上位机重传整包
+      }
     }
   }
   return 0;
@@ -240,11 +252,27 @@ static uint8_t fw_iap_start_common(const uint8_t *data, uint32_t len)
   }
   /* 版本单调：下限取"当前正在运行的那份固件"的版本，不另存历史水位。
    * 设备回滚到低版本后运行版本随之降低，试图刷到低于当前运行版本的行为会被拒绝。 */
-  if((fw_img_locate(fw_iap_old_slot(), SLOT_SIZE, &cur_meta) == FW_IMG_OK) &&
-     (cur_meta.image_ver != 0u) &&
-     (fw_img_ver_verify(cache.info.image_ver, cur_meta.image_ver) != FW_IMG_OK))
+  if(fw_img_locate(fw_iap_old_slot(), SLOT_SIZE, &cur_meta) == FW_IMG_OK)
   {
-    return FW_IAP_HEX_ST_VERSION_OLD;
+    if((cur_meta.image_ver != 0u) &&
+       (fw_img_ver_verify(cache.info.image_ver, cur_meta.image_ver) != FW_IMG_OK))
+    {
+      return FW_IAP_HEX_ST_VERSION_OLD;
+    }
+  }
+  else
+  {
+    /* 运行槽镜像不可解析时退回用另一槽的版本作下限，避免元数据损坏后版本检查被整体跳过；
+     * 两槽都不可解析说明设备处于出厂或全损坏状态，放行升级作为恢复通道 */
+    uint32_t alt_addr = (fw_iap_old_slot() == SLOT0_ADDR) ? SLOT1_ADDR : SLOT0_ADDR;
+    fw_img_meta_t alt_meta;
+
+    if((fw_img_locate(alt_addr, SLOT_SIZE, &alt_meta) == FW_IMG_OK) &&
+       (alt_meta.image_ver != 0u) &&
+       (fw_img_ver_verify(cache.info.image_ver, alt_meta.image_ver) != FW_IMG_OK))
+    {
+      return FW_IAP_HEX_ST_VERSION_OLD;
+    }
   }
   cache.code_len = code_len;
   cache.image_len = cache.info.image_len;
@@ -408,7 +436,9 @@ static void fw_iap_hex_start_delta(const uint8_t *data, uint16_t len)
               ((uint32_t)data[FW_IMG_META_LEN + 5u] << 8) |
               ((uint32_t)data[FW_IMG_META_LEN + 6u] << 16) |
               ((uint32_t)data[FW_IMG_META_LEN + 7u] << 24);
-  if(delta_len == 0u || delta_len > FW_IAP_IMAGE_MAX_SIZE)
+  //差分包长度只用于进度与完成判定，不预分配缓冲，不受槽位大小限制，
+  //但仍要挡住明显异常的声明，否则进度百分比会被无意义缩小
+  if((delta_len == 0u) || (delta_len > FW_IAP_DELTA_MAX_STREAM))
   {
     fw_iap_hex_fail(FW_IAP_HEX_ST_SIZE);
     return;
@@ -496,6 +526,12 @@ static void fw_iap_hex_delta_finish(void)
     fw_iap_hex_fail(FW_IAP_HEX_ST_DELTA_FORMAT);
     return;
   }
+  //向量表：栈顶落在RAM、复位向量落在Flash，与整包路径保持同一套校验
+  if(fw_img_vectors_ok(cache.write_addr) != FW_IMG_OK)
+  {
+    fw_iap_hex_fail(FW_IAP_HEX_ST_IMAGE_INVALID);
+    return;
+  }
   //代码CRC32：与镜像元数据里登记的值比对
   if(FW_IMG_CRC32_FINAL(cache.code_crc) != cache.info.code_crc32)
   {
@@ -527,6 +563,29 @@ static void fw_iap_hex_delta_finish(void)
 #endif /* FW_IAP_DELTA_ENABLE */
 
 /**
+ * @brief   校验重传帧内容与已落盘数据是否一致
+ * @param   offset  帧在代码内的偏移
+ * @param   data    重传的数据
+ * @param   len     数据长度
+ * @return  1=一致或无法比对，0=内容不一致
+ * @note    差分模式的offset是差分流偏移，Flash里存的是重建输出，无法按偏移回读，
+ *          该模式直接放行，格式错误由解码器兜底。
+ */
+static int fw_iap_hex_retransmit_match(uint32_t offset, const uint8_t *data, uint16_t len)
+{
+  static uint8_t cmp_buf[FW_IAP_HEX_DATA_MAX];//整包模式下回读比对用的暂存
+  if((cache.pack_mode != 0u) || (len == 0u) || (len > FW_IAP_HEX_DATA_MAX))
+  {
+    return 1;
+  }
+  if(fw_port_flash_read(cache.write_addr + offset, cmp_buf, len) != 0)
+  {
+    return 1;//读回失败不作为判失败依据，留给上层重传
+  }
+  return (memcmp(cmp_buf, data, len) == 0) ? 1 : 0;
+}
+
+/**
  * @brief   处理DATA帧：写Flash，收满即校验并提交
  * @param   offset  本帧在代码内的偏移
  * @param   data    数据指针
@@ -544,7 +603,8 @@ static void fw_iap_hex_data(uint32_t offset, const uint8_t *data, uint16_t len)
   if(cache.in_progress == 0u)
   {
     if(cache.received_size > 0u && offset <= cache.received_size
-       && (cache.received_size - offset) == (uint32_t)len)
+       && (cache.received_size - offset) == (uint32_t)len
+       && fw_iap_hex_retransmit_match(offset, data, len))
     {
       fw_iap_hex_send_resp(cache.received_size, FW_IAP_HEX_ST_OK);
       return;
@@ -552,9 +612,15 @@ static void fw_iap_hex_data(uint32_t offset, const uint8_t *data, uint16_t len)
     fw_iap_hex_send_resp(cache.received_size, FW_IAP_HEX_ST_NOT_STARTED);
     return;
   }
-  //重传：帧尾恰好落在写入前沿，只回RESP，不重复写入
+  //重传：帧尾恰好落在写入前沿，内容一致才回RESP，不重复写入
   if(offset <= cache.received_size && (cache.received_size - offset) == (uint32_t)len)
   {
+    if(!fw_iap_hex_retransmit_match(offset, data, len))
+    {
+      //重传内容与已写入数据不符：不能当成正常重传放过，回期望偏移让上位机重发
+      fw_iap_hex_send_resp(cache.received_size, FW_IAP_HEX_ST_OFFSET_ERROR);
+      return;
+    }
     fw_iap_hex_send_resp(cache.received_size, FW_IAP_HEX_ST_OK);
     return;
   }
@@ -579,7 +645,7 @@ static void fw_iap_hex_data(uint32_t offset, const uint8_t *data, uint16_t len)
       return;
     }
     cache.received_size += len;
-    cache.percent = (uint8_t)((cache.received_size * 100u) / cache.delta_len);
+    cache.percent = (uint8_t)(((uint64_t)cache.received_size * 100u) / cache.delta_len);
     if(cache.received_size == cache.delta_len)
     {
       fw_iap_hex_delta_finish();
@@ -689,9 +755,20 @@ static void fw_iap_hex_handle_frame(uint8_t *f)
 */
 iap_state_t fw_iap_get_status(uint32_t *total_size, uint32_t *received_size, uint8_t *percent)
 {
-  *total_size = cache.image_len;
-  *received_size = cache.received_size;
-  *percent = cache.percent;
+  //出参允许为NULL：调用方只关心其中一项时不必全都传
+  if(total_size != NULL)
+  {
+    //差分模式下received_size是差分流偏移，total_size也报流总长，两者才可比
+    *total_size = (cache.pack_mode == 1u) ? cache.delta_len : cache.image_len;
+  }
+  if(received_size != NULL)
+  {
+    *received_size = cache.received_size;
+  }
+  if(percent != NULL)
+  {
+    *percent = cache.percent;
+  }
   if(cache.in_progress != 0u)
   {
     return FW_IAP_RUNNING;
@@ -702,7 +779,10 @@ iap_state_t fw_iap_get_status(uint32_t *total_size, uint32_t *received_size, uin
   {
     return FW_IAP_DONE;
   }
-  *percent = 0u;   //空闲：无会话，进度按0上报
+  if(percent != NULL)
+  {
+    *percent = 0u;   //空闲：无会话，进度按0上报
+  }
   return FW_IAP_IDLE;
 }
 

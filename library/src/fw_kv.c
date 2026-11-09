@@ -1097,15 +1097,16 @@ static int fw_kv_sector_activate_next(fw_kv_t *kv)
   free_count = fw_kv_free_sector_count(kv);
   if(free_count <= 1U)
   {
-    if(fw_kv_gc_collect(kv) == FW_KV_OK)
+    int gc_ret = fw_kv_gc_collect(kv);
+
+    if(gc_ret == FW_KV_OK)
     {
       return FW_KV_OK;//GC成功后active已指向搬迁目标扇区
     }
-    if(free_count == 0U)
-    {
-      return FW_KV_ERR_NOSPC;//一个空扇区都没有，无法做掉电安全GC
-    }
-    /* 只剩1个空扇区且GC没成功(例如没有垃圾可回收)：退化为直接占用该空扇区 */
+    /*GC失败时不论还剩0个还是1个空扇区都不再占用：最后一个空扇区是下次GC的
+     *搬迁目标，占用它会让free_count降到0，此后只能走donor路径，活跃扇区写满
+     *即永久NOSPC。Flash擦写失败的根因也要如实上报，不能统一成空间不足*/
+    return (gc_ret == FW_KV_ERR_FLASH) ? FW_KV_ERR_FLASH : FW_KV_ERR_NOSPC;
   }
 
   /* 先找空扇区(无效扇区头，或有效但无记录的备用扇区) */
@@ -1178,16 +1179,20 @@ static int fw_kv_node_append(fw_kv_t *kv, uint32_t key, const uint8_t *value,
   //写入节点头
   if(kv->ops.write(addr, (const uint8_t *)&hdr, sizeof(hdr)) != 0)
   {
+    //写失败时跳过本条记录占用的区域，避免下一次写重新编程同一批字节
+    kv->used += (rec_len + 3u) & ~3u;
     return FW_KV_ERR_FLASH;
   }
   //写入value
   if(len > 0 && kv->ops.write(addr + sizeof(hdr), value, len) != 0)
   {
+    kv->used += (rec_len + 3u) & ~3u;
     return FW_KV_ERR_FLASH;
   }
   //写入CRC
   if(kv->ops.write(addr + sizeof(hdr) + len, (const uint8_t *)&crc, sizeof(crc)) != 0)
   {
+    kv->used += (rec_len + 3u) & ~3u;
     return FW_KV_ERR_FLASH;
   }
 
@@ -1269,6 +1274,11 @@ int fw_kv_init(fw_kv_t *kv, const fw_kv_part_t *part)
   if((part->sector_size % part->page_size) != 0u)
   {
     return FW_KV_ERR_PARAM;//扇区大小必须是页大小的整数倍
+  }
+  //扇区至少要放得下扇区头加一条最小记录，否则后续按减法算出的长度上界会回绕
+  if(part->sector_size < (sizeof(wl_sector_hdr_t) + sizeof(wl_node_hdr_t) + sizeof(uint32_t)))
+  {
+    return FW_KV_ERR_PARAM;
   }
   //初始化实例字段(同时保存分区名，供日志回调使用)
   //从这里开始读写实例状态，先获取锁，避免与另一任务对本实例的读写并发
@@ -1477,11 +1487,13 @@ static int fw_kv_get_impl(fw_kv_t *kv, uint32_t key, uint8_t *value, uint32_t *l
 static int fw_kv_ensure_space(fw_kv_t *kv, uint32_t rec_len)
 {
   uint32_t gc_watermark;
+  int ret;
 
   //如果没有活动扇区，激活一个
   if(kv->active_sector < 0)
   {
-    if(fw_kv_sector_activate_next(kv) != FW_KV_OK) return FW_KV_ERR_NOSPC;
+    ret = fw_kv_sector_activate_next(kv);
+    if(ret != FW_KV_OK) return ret;
   }
 
   gc_watermark = (uint32_t)FW_KV_GC_THRESHOLD * kv->page_size;
@@ -1489,7 +1501,8 @@ static int fw_kv_ensure_space(fw_kv_t *kv, uint32_t rec_len)
   /* 放不下：必须切换/GC */
   if(kv->used + rec_len > kv->sector_size)
   {
-    if(fw_kv_sector_activate_next(kv) != FW_KV_OK) return FW_KV_ERR_NOSPC;
+    ret = fw_kv_sector_activate_next(kv);
+    if(ret != FW_KV_OK) return ret;
     if(kv->used + rec_len > kv->sector_size) return FW_KV_ERR_NOSPC;
     return FW_KV_OK;
   }
@@ -1524,12 +1537,18 @@ static int fw_kv_set_impl(fw_kv_t *kv, uint32_t key, const uint8_t *value, uint3
   uint32_t offset;
   uint32_t seq;
   uint32_t sector;
+  int ret;
 
   if(!kv || key == 0U || (value == NULL && len > 0U))
   {
     return FW_KV_ERR_PARAM;
   }
 
+  //扇区容量必须能放下一条最小记录，否则下面按减法算出的长度上界会回绕成极大值
+  if(kv->sector_size <= (sizeof(wl_sector_hdr_t) + sizeof(wl_node_hdr_t) + sizeof(uint32_t)))
+  {
+    return FW_KV_ERR_NOSPC;
+  }
   //先按单扇区容量校验 len 上界，再做加法：否则 len 接近 UINT32_MAX 时 rec_len 会回绕绕过边界检查
   if(len > (kv->sector_size - sizeof(wl_sector_hdr_t) - sizeof(wl_node_hdr_t) - sizeof(uint32_t)))
   {
@@ -1537,10 +1556,12 @@ static int fw_kv_set_impl(fw_kv_t *kv, uint32_t key, const uint8_t *value, uint3
   }
   rec_len = sizeof(wl_node_hdr_t) + len + sizeof(uint32_t);
 
-  if(fw_kv_ensure_space(kv, rec_len) != FW_KV_OK)
+  ret = fw_kv_ensure_space(kv, rec_len);
+  if(ret != FW_KV_OK)
   {
-    FW_KV_LOG(FW_KV_EVT_ERROR, kv, FW_KV_ERR_NOSPC, 0, 0);
-    return FW_KV_ERR_NOSPC;
+    //空间不足与Flash擦写失败要分开上报，便于现场区分
+    FW_KV_LOG(FW_KV_EVT_ERROR, kv, ret, 0, 0);
+    return ret;
   }
 
   //空间确保后(可能已轮转或GC)再取本条记录的位置：就是当前已用位置
@@ -1611,11 +1632,20 @@ static int fw_kv_del_impl(fw_kv_t *kv, uint32_t key)
   return FW_KV_OK;
 }
 
+/* 对外接口统一校验实例是否已初始化：静态零初始化实例的ops是空函数指针，
+ * 直接调用会跳到0地址执行，必须先判 */
+static int fw_kv_ready(const fw_kv_t *kv)
+{
+  return (kv != NULL && kv->ops.read != NULL && kv->ops.write != NULL &&
+          kv->ops.erase != NULL) ? 1 : 0;
+}
+
 //以下是对外接口，带并发保护
 int fw_kv_get(fw_kv_t *kv, uint32_t key, uint8_t *value, uint32_t *len)
 {
   int ret;
 
+  if(!fw_kv_ready(kv)) return FW_KV_ERR_PARAM;
   FW_KV_LOCK();
   ret = fw_kv_get_impl(kv, key, value, len);
   FW_KV_UNLOCK();
@@ -1626,6 +1656,7 @@ int fw_kv_set(fw_kv_t *kv, uint32_t key, const uint8_t *value, uint32_t len)
 {
   int ret;
 
+  if(!fw_kv_ready(kv)) return FW_KV_ERR_PARAM;
   FW_KV_LOCK();
   ret = fw_kv_set_impl(kv, key, value, len);
   FW_KV_UNLOCK();
@@ -1636,6 +1667,7 @@ int fw_kv_del(fw_kv_t *kv, uint32_t key)
 {
   int ret;
 
+  if(!fw_kv_ready(kv)) return FW_KV_ERR_PARAM;
   FW_KV_LOCK();
   ret = fw_kv_del_impl(kv, key);
   FW_KV_UNLOCK();

@@ -129,6 +129,7 @@ bool SerialTransport::open(QString &error)
   linkBroken = false;    //新打开的句柄重新开始
   probeTickPoll = 0;    //计数从零开始
   probeTickWait = 0;
+  port.clear();    //丢弃上一次会话残留的收发字节，避免旧数据被当成新帧解析
   //重复打开时必须先断开上一次的连接，否则信号会重复触发
   QObject::disconnect(&port, &QSerialPort::errorOccurred, nullptr, nullptr);
   //USB转串口被拔出时Qt只通过该信号报告，主动记下来供读写路径判断
@@ -149,6 +150,7 @@ void SerialTransport::close()
 {
   if(port.isOpen())    //仅在串口处于打开状态时才关闭
   {
+    port.waitForBytesWritten(500);    //先等发送缓冲排空，避免最后一帧被截断
     port.close();    //关闭串口并释放系统句柄
   }
   linkBroken = false;    //关闭后不再保留失效标记
@@ -166,16 +168,23 @@ bool SerialTransport::write(const uint8_t *data, std::size_t len)
   {
     return false;
   }
-  const qint64 written = port.write(reinterpret_cast<const char *>(data),
-                                    static_cast<qint64>(len));    //按Qt接口的长度类型写入原始字节
-  if(written != static_cast<qint64>(len))    //写入长度不足说明发送失败
+  //分次写完：驱动发送缓冲有限时write可能只接受一部分，剩余部分要继续写，
+  //否则一次短写就被判成整帧发送失败，上层只能靠重传
+  std::size_t sent = 0;
+  while(sent < len)
   {
-    return false;
-  }
-  //等待数据交给驱动；个别USB转串口驱动会误报超时，因此只在仍有数据没发出去时才判定失败
-  if(!port.waitForBytesWritten(1000) && port.bytesToWrite() > 0)    //等待失败且发送缓冲仍未清空
-  {
-    return false;    //端口已失效，交给上层按链路故障处理
+    const qint64 written = port.write(reinterpret_cast<const char *>(data) + sent,
+                                      static_cast<qint64>(len - sent));    //按Qt接口的长度类型写入剩余字节
+    if(written <= 0)    //驱动拒绝写入说明端口已不可用
+    {
+      return false;
+    }
+    sent += static_cast<std::size_t>(written);
+    //等待数据交给驱动；个别USB转串口驱动会误报超时，因此只在仍有数据没发出去时才判定失败
+    if(!port.waitForBytesWritten(1000) && port.bytesToWrite() > 0)    //等待失败且发送缓冲仍未清空
+    {
+      return false;    //端口已失效，交给上层按链路故障处理
+    }
   }
   return true;
 }
@@ -255,7 +264,7 @@ int SerialTransport::read(uint8_t *data, std::size_t len, int timeoutMs)
         return -1;    //按链路失败处理
       }
       //升级期间拔线时端口既不关闭也不报错，定期确认它是否还在系统里
-      if(++probeTickWait >= 20)    //每次等待10毫秒，约200毫秒确认一次
+      if(++probeTickWait >= 200)    //每次等待10毫秒，约2秒确认一次，避免频繁枚举端口拖慢取数
       {
         probeTickWait = 0;    //重新计数
         bool present = false;    //端口是否仍在可用列表里

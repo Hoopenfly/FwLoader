@@ -19,11 +19,11 @@ std::vector<uint8_t> build_fwd(const DeltaPack &pack);
 
 /**
  * @brief   解析.fwd文件字节
- * @param   data  文件字节
+ * @param   data  文件字节，按值传入以便内部直接接管记录流，调用方可传std::move
  * @param   pack  输出
  * @return  true成功
  */
-bool parse_fwd(const std::vector<uint8_t> &data, DeltaPack &pack);
+bool parse_fwd(std::vector<uint8_t> data, DeltaPack &pack);
 
 /**
  * @brief   写.fwd文件

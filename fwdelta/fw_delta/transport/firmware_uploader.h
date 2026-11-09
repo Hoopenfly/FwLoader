@@ -17,12 +17,20 @@
 class FirmwareUploader
 {
 public:
+  //上传阶段，供界面区分"正在发送"与"已在等设备处理"
+  enum Phase
+  {
+    kPhaseSending = 0,     //正在发送数据帧，取消可立即停住
+    kPhaseWaitDevice = 1   //末帧已发出，设备在自行校验或重建，取消只能停止等待
+  };
+
   //一次升级的结果
   struct Result
   {
     bool ok = false;          //是否收到有效响应
     bool cancelled = false;   //是否被调用方主动取消
     bool fatal = false;       //传输链路已断开，重试没有意义
+    bool waitingDevice = false;  //取消发生时是否已进入等设备处理阶段
     uint8_t status = 0xFF;    //设备状态码
     uint32_t offset = 0;      //设备确认位置
     QString error;            //错误描述
@@ -45,6 +53,14 @@ public:
    * @param   sink  接收日志文字的回调，空表示不输出
    */
   void setLogSink(const std::function<void(const QString &)> &sink);
+
+  /**
+   * @brief   设置阶段回调，进入或离开"等设备处理"阶段时调用
+   * @param   sink  接收Phase值的回调，空表示不通知
+   * @note    末帧发出后设备要自行校验、重建并提交，这段时间里界面不能
+   *          再声称"可以取消"，据此把按钮语义切换成停止等待。
+   */
+  void setPhaseSink(const std::function<void(int)> &sink);
 
   /**
    * @brief   发送整包固件
@@ -104,6 +120,12 @@ private:
   bool readResp(uint32_t &offset, uint8_t &status, int timeoutMs, bool &fatal, bool &cancelled);
 
   /**
+   * @brief   广播当前上传阶段
+   * @param   phase Phase取值，sink为空时什么也不做
+   */
+  void notifyPhase(int phase);
+
+  /**
    * @brief   写小端16位
    */
   static void putU16(std::vector<uint8_t> &out, uint16_t value);
@@ -116,6 +138,11 @@ private:
   IFirmwareTransport *transport;   //字节流通道
   std::function<bool()> cancelCheck;  //取消检查回调，空表示不检查
   std::function<void(const QString &)> logSink;  //界面日志回调，空表示不输出
+  std::function<void(int)> phaseSink;  //阶段回调，空表示不通知
+  //RESP累积缓冲跨调用保留：超时后才到达的后半帧能与下一段拼成完整帧，
+  //不必把整帧重发；其中残留的旧应答由transact里的偏移比对丢弃
+  std::vector<uint8_t> respBuffer;
+  std::size_t respScanned = 0;    //已确认不可能构成帧起始的前缀长度
 };
 
 #endif // FIRMWAREUPLOADER_H

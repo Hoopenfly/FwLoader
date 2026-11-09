@@ -236,6 +236,10 @@ int inspect_meta_file(const std::string &path, ImageMeta &out)
   {
     return 0;                                       //不可能自带镜像元数据，按纯代码处理
   }
+  if(size > static_cast<std::streamoff>(0xFFFFFFFFull))  //镜像长度字段是32位，超长文件无法表示
+  {
+    return -1;                                      //按文件不合法处理，避免截断后误判相等
+  }
 
   in.seekg(size - static_cast<std::streamoff>(kImgMetaLen));  //定位到末尾64字节
   uint8_t buf[kImgMetaLen] = {0};                   //只读镜像元数据，代码区完全不加载

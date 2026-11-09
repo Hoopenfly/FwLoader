@@ -111,6 +111,7 @@ FwBridge::FwBridge(QObject *parent) : QObject(parent)    //初始化基类，其
     log(text);    //统一加时间戳后追加到GUI线程日志
   });
   connect(m_runner, &TransportRunner::flashFinished, this, &FwBridge::onFlashFinished);    //升级结束
+  connect(m_runner, &TransportRunner::flashPhaseChanged, this, &FwBridge::onFlashPhaseChanged);    //上传阶段
   //设备主动打印的内容由传输线程读出后交给GUI线程解析
   connect(m_runner, &TransportRunner::rawBytes, this, &FwBridge::onRawBytes);
   connect(m_runner, &TransportRunner::linkLost, this, &FwBridge::onLinkLost);
@@ -129,18 +130,19 @@ FwBridge::FwBridge(QObject *parent) : QObject(parent)    //初始化基类，其
 FwBridge::~FwBridge()
 {
   m_cancelRequested = true;    //先置取消标志，让升级流程在下一帧前退出
-  if(m_deltaFuture.isRunning())    //差分生成线程仍在运行时必须等待
-  {
-    m_deltaFuture.waitForFinished();    //阻塞到线程收尾，防止悬空访问
-  }
+  /* 任务可能已提交到线程池但还没抢到线程，此时isRunning()为false，
+     只按isRunning判断会跳过等待，任务随后仍可能在this销毁后执行。
+     waitForFinished()对未开始的任务同样会等到结束，对无任务的future立即返回 */
+  m_deltaFuture.waitForFinished();    //阻塞到线程收尾，防止悬空访问
   if(m_thread)    //传输线程存在时先停事件循环再等待
   {
     m_thread->quit();    //请求事件循环退出
-    if(!m_thread->wait(15000))    //最多等待15秒，覆盖单帧超时重试
+    m_thread->requestInterruption();    //通知正在阻塞的收发循环尽快返回
+    if(!m_thread->wait(30000))    //最多等待30秒，覆盖取消后末帧的收尾
     {
-      //线程仍在运行：此时销毁 QThread 会触发 qFatal 直接终止进程，先终止线程再等待
-      m_thread->requestInterruption();    //通知线程尽快返回
-      m_thread->terminate();    //强制结束线程，避免析构时进程被 qFatal 带走
+      /* 线程仍未退出：强杀线程会打断Qt的串口I/O，属于未定义行为，
+         只在等待超时后作为最后手段使用，避免~QThread在运行时析构触发qFatal */
+      m_thread->terminate();    //强制结束线程，避免析构时进程被qFatal带走
       m_thread->wait(2000);    //给终止后的线程留出收尾时间
     }
   }
@@ -221,6 +223,15 @@ int FwBridge::progress() const
 }
 
 /**
+ * @brief   取当前上传阶段
+ * @return  0仍在发送、1已把数据发完在等设备处理
+ */
+int FwBridge::flashPhase() const
+{
+  return m_flashPhase;    //由传输线程的阶段回调更新
+}
+
+/**
  * @brief   取全部日志文本
  * @return  带时间戳的多行日志，供复制与导出；发送阶段末尾追加两行实时进度
  */
@@ -232,6 +243,15 @@ QString FwBridge::logText() const
     return m_logText;    //非发送阶段只返回历史日志
   }
   return m_logText + QLatin1String("<br>") + progressLines(true);    //追加带颜色标记的两行，历史日志本身用<br>分隔
+}
+
+/**
+ * @brief   取日志正文长度，不含末尾实时进度行
+ * @return  已累积的历史日志字符数
+ */
+int FwBridge::logBodyLength() const
+{
+  return m_logText.length();    //进度行是渲染时临时拼接的，不属于正文
 }
 
 /**
@@ -547,10 +567,13 @@ void FwBridge::closeConnection()    //复位界面状态并把关闭请求投递
   setClientInfo(QString());    //清空客户端信息
   m_clientList.clear();    //客户端缓存同步清空
   m_clientRows.clear();
-  m_clientIndex = 0;    //选择索引回到默认项
+  if(m_clientIndex != -1)    //列表已清空，选中项一并复位
+  {
+    m_clientIndex = -1;    //取消选中
+    emit clientIndexChanged();    //通知界面刷新选中行
+  }
   m_transportType = -1;    //通道已释放，类型复位
   m_role = 0;    //角色复位
-  emit clientIndexChanged();    //通知界面刷新选中行
   emit clientListChanged();    //通知界面清空客户端列表
 
   TransportRunner *runner = m_runner;
@@ -671,7 +694,7 @@ void FwBridge::emitLog(int kind, const QString &text)
 //定时向传输线程索取被动数据，升级期间不读取以免抢数据
 void FwBridge::pollPassive()
 {
-  if(!m_connected || m_flashActive || !m_runner)    //未连接、升级中、执行器缺失时跳过
+  if(!m_connected || m_busy || !m_runner)    //未连接、升级中、执行器缺失时跳过
   {
     return;
   }
@@ -720,7 +743,17 @@ void FwBridge::onRawBytes(const QByteArray &bytes)
     }
 
     const QByteArray frame = m_rxBuffer.left(total);    //取出一整帧
+    //CRC16覆盖帧头到载荷；不符说明是设备打印里凑巧出现的55AA，整段按文本处理
+    const uint16_t crcCalc = fw::crc16(reinterpret_cast<const uint8_t *>(frame.constData()),
+                                       static_cast<std::size_t>(9 + len));
+    const uint16_t crcGot = static_cast<uint8_t>(frame[9 + len])
+                          | (static_cast<uint8_t>(frame[9 + len + 1]) << 8);
     m_rxBuffer.remove(0, total);
+    if(crcCalc != crcGot)
+    {
+      flushText(frame);    //校验失败不丢字节，交给文本通道输出
+      continue;
+    }
 
     if((static_cast<uint8_t>(frame[2]) & 0x0Fu) == 0x02u && len == 1)    //是设备响应帧
     {
@@ -737,31 +770,44 @@ void FwBridge::onRawBytes(const QByteArray &bytes)
 //把一段原始字节按行输出为设备打印文本
 void FwBridge::flushText(const QByteArray &raw)
 {
-  //串口打开瞬间常收到一串0x00噪声，直接按UTF-8解码会在行首留下方框，先剔掉不可见控制字符
-  QByteArray clean;    //过滤后的字节
-  clean.reserve(raw.size());    //按原长度预留，避免多次扩容
+  constexpr int kTextBufLimit = 8192;    //未成行缓冲上限，防止设备持续输出无换行数据把内存撑大
 
+  //按原始字节累积，整行收齐后再解码：UTF-8多字节字符被拆到两次回调里也不会碎
   for(const char c : raw)    //逐字节检查
   {
     const int code = static_cast<uint8_t>(c);    //按无符号数判断取值范围
-    if(code == 0x0A || code == 0x0D || code >= 0x20)    //保留换行与可打印字节
+    //保留制表符、换行与可打印字节；串口打开瞬间常收到一串0x00噪声，其余控制字符丢弃
+    if(code == 0x09 || code == 0x0A || code == 0x0D || code >= 0x20)
     {
-      clean.append(c);
+      m_textBuffer.append(c);
     }
   }
 
-  m_textBuffer += QString::fromUtf8(clean);    //按UTF-8解码后累积
+  if(m_textBuffer.size() > kTextBufLimit)    //一直没等到换行，不能无限累积
+  {
+    if(m_textBuffer.indexOf('\n') < 0)    //整段都没有换行，直接作为一行输出
+    {
+      QString whole = QString::fromUtf8(m_textBuffer);    //整体解码
+      whole.remove(QChar(0xFFFD));    //去掉解码失败的替换字符，避免行首出现乱码
+      if(!whole.trimmed().isEmpty())
+      {
+        logDevice(whole);    //设备打印按深色显示
+      }
+      m_textBuffer.clear();
+      return;
+    }
+  }
 
   int pos = -1;
-  while((pos = m_textBuffer.indexOf(QLatin1Char('\n'))) >= 0)    //逐行切分
+  while((pos = m_textBuffer.indexOf('\n')) >= 0)    //逐行切分
   {
-    QString line = m_textBuffer.left(pos);    //取出一行
-    m_textBuffer.remove(0, pos + 1);          //从缓冲移除
-    if(line.endsWith(QLatin1Char('\r')))      //去掉行尾回车
+    QString line = QString::fromUtf8(m_textBuffer.left(pos));    //行尾才按UTF-8解码
+    m_textBuffer.remove(0, pos + 1);    //从缓冲移除
+    if(line.endsWith(QLatin1Char('\r')))    //去掉行尾回车
     {
       line.chop(1);
     }
-    line.remove(QChar(0xFFFD));               //去掉解码失败的替换字符，避免行首出现乱码
+    line.remove(QChar(0xFFFD));    //去掉解码失败的替换字符，避免行首出现乱码
     if(!line.trimmed().isEmpty())    //空行不输出
     {
       logDevice(line);    //设备打印按深色显示，与上位机提示区分
@@ -840,25 +886,39 @@ void FwBridge::appendLog(int kind, const QString &stamp, const QString &text)   
   const QString color = logColor(kind);    //本条日志的内容颜色
   const QString tag = logTag(kind);        //本条日志的来源标签
   const QStringList lines = text.split(QLatin1Char('\n'));    //逐行渲染，每行都带同一个时间戳
+  QString segment;    //本次新增的富文本片段，供界面按增量追加
 
   for(int i = 0; i < lines.size(); ++i)    //逐行处理
   {
+    const QString line = QStringLiteral("[%1] <span style=\"color:%2\">[%3] %4</span>")
+                         .arg(stamp, color, tag, escapeHtml(lines.at(i), kind == kLogDevice));    //时间戳保持原色，标签与内容同色
     if(!m_logText.isEmpty())    //已有内容时先补分隔
     {
       m_logText += QStringLiteral("<br>");    //富文本里的换行
       m_plainLog += QLatin1Char('\n');        //纯文本里的换行
+      segment += QStringLiteral("<br>");      //增量片段同样需要分隔符
     }
-    m_logText += QStringLiteral("[%1] <span style=\"color:%2\">[%3] %4</span>")
-                 .arg(stamp, color, tag, escapeHtml(lines.at(i), kind == kLogDevice));    //时间戳保持原色，标签与内容同色
+    m_logText += line;    //拼进全文
+    segment += line;      //拼进增量片段
     m_plainLog += QStringLiteral("[%1] [%2] %3").arg(stamp, tag, lines.at(i));    //导出用的纯文本也带标签
     ++m_logCount;    //累计行数，用于控制总量
   }
 
+  bool trimmed = false;    //本次是否发生了裁剪
   if(m_logCount > 2000)    //超过上限时裁掉最老的一批，避免长时间运行后界面越来越慢
   {
     trimLog();    //按行裁剪
+    trimmed = true;    //裁剪后尾部增量失效，必须让界面整段重设
   }
-  emit logTextChanged();    //通知界面滚动到最新内容
+  if(trimmed)    //裁剪后全文已变，界面只能整段重绘
+  {
+    emit logTextChanged();    //通知界面重设全文
+  }
+  else    //常规追加走增量信号，避免每帧整段复制富文本
+  {
+    emit logSegmentAppended(segment);    //界面按片段追加
+    emit logTextChanged();    //其它消费者仍可依赖全文变化信号
+  }
 }
 
 //日志超过上限时丢掉最老的一部分，保持两份文本仍然逐行对应
@@ -963,6 +1023,7 @@ void FwBridge::clearLog()    //只清文本，不影响后续追加
 {
   m_logText.clear();    //丢弃全部历史日志
   m_plainLog.clear();   //纯文本同步清空
+  m_logCount = 0;    //计数一并归零，否则下一条日志立刻触发裁剪把新内容裁掉
   emit logTextChanged();    //界面文本同步清空
 }
 
@@ -1170,10 +1231,25 @@ void FwBridge::startFlash(const QString &newPath, const QString &fwdPath)    //�
     log(QStringLiteral("传输线程尚未就绪，请稍后重试"));    //给出可见反馈
     return;
   }
+  if(newPath.isEmpty())    //没有目标固件就没有可写入的镜像
+  {
+    log(QStringLiteral("请先选择新固件"));    //带差分包时必须明确它对应哪份新固件
+    postStatus(QStringLiteral("升级失败"));
+    return;
+  }
+  if(QDateTime::currentMSecsSinceEpoch() < m_deviceBusyUntilMs)    //上一轮的设备可能还在写Flash
+  {
+    //设备重建期间不读串口，这时发新帧只会堆在缓冲里，还可能被当成上一轮的残留
+    log(QStringLiteral("设备仍在处理上一轮升级，请先复位设备再开始新的烧录"));
+    postStatus(QStringLiteral("设备处理中，请先复位"));
+    return;
+  }
 
   setBusy(true);    //界面进入忙碌态
   m_progress = 0;    //进度从0开始
   emit progressChanged(0);    //让界面立即回到0，而不是沿用上次的进度
+  m_flashPhase = 0;    //新一轮从发送阶段开始
+  emit flashPhaseChanged();
   m_cancelRequested = false;    //清除上一次的取消标记
   const QString newFile = localPath(newPath);    //QML拖拽路径在GUI线程还原
   const QString fwdFile = localPath(fwdPath);    //差分包路径同样还原
@@ -1232,6 +1308,10 @@ void FwBridge::onOpenFinished(bool ok, const QString &info, const QString &error
 
 void FwBridge::onClosedFinished()    //传输线程关闭完成
 {
+  if(m_connected || m_connecting)    //关闭完成回调晚到时，不能把刚建立的新连接状态清掉
+  {
+    return;
+  }
   if(m_listenTimer)    //通道关闭后停止被动读取
   {
     m_listenTimer->stop();
@@ -1266,6 +1346,16 @@ void FwBridge::onLinkLost(const QString &reason)    //传输线程发现链路�
   setConnected(false);   //复位界面连接状态
   setStatus(QStringLiteral("通道已断开"));
   setDeviceInfo(QStringLiteral("未连接"));
+  //链路断开后客户端表已失效，不清会让界面一直显示已经不存在的连接
+  setClientInfo(QString());    //清空客户端信息
+  m_clientList.clear();    //清空客户端描述缓存
+  m_clientRows.clear();    //清空表格行缓存
+  if(m_clientIndex != -1)    //仅在仍有选中时复位，避免多余信号
+  {
+    m_clientIndex = -1;    //取消选中
+    emit clientIndexChanged();    //通知界面取消高亮
+  }
+  emit clientListChanged();    //通知界面清空客户端列表
 }
 
 void FwBridge::onClientsChanged(const QStringList &infos, const QVariantList &rows)    //传输线程上报客户端列表
@@ -1280,10 +1370,15 @@ void FwBridge::onClientsChanged(const QStringList &infos, const QVariantList &ro
       emit clientIndexChanged();    //通知界面取消高亮
     }
   }
-  else if(m_clientIndex >= m_clientList.size())    //选中的客户端已断开时回到第一项
+  else if(m_clientIndex >= m_clientList.size() || m_clientIndex < 0)    //选中项已不存在或未选中
   {
-    m_clientIndex = 0;    //索引归零
-    emit clientIndexChanged();    //通知界面更新选中行
+    /* 不自动改选第一项：列表变化后原索引已经指向另一台设备，
+       自动选中会让下一次烧录打到别的板子上，改为取消选中等操作者重新指定 */
+    if(m_clientIndex != -1)
+    {
+      m_clientIndex = -1;    //取消选中
+      emit clientIndexChanged();    //通知界面取消高亮
+    }
   }
   emit clientListChanged();    //通知界面刷新列表
 }
@@ -1296,7 +1391,7 @@ void FwBridge::onRunnerProgress(int percent)    //传输线程上报升级进度
     m_flashActive = true;    //打开日志末尾的进度行
     m_progressStamp = QDateTime::currentDateTime().toString(QStringLiteral("HH:mm:ss.zzz"));    //记下起始时刻，整段发送期间不再变化
   }
-  emit logTextChanged();    //让进度行跟着刷新
+  emit progressLineChanged();    //只让界面替换末尾进度行，避免每帧整段重排
 }
 
 void FwBridge::onFramesChanged(uint32_t frameCurrent, uint32_t frameTotal)    //传输线程上报帧号
@@ -1320,7 +1415,8 @@ void FwBridge::onRunnerStatus(const QString &text)    //传输线程上报状态
   setStatus(text);    //写属性并发信号
 }
 
-void FwBridge::onFlashFinished(bool ok, bool linkBroken, const QString &message)    //传输线程升级结束
+void FwBridge::onFlashFinished(bool ok, bool linkBroken, bool stoppedWaiting,
+                               const QString &message)    //传输线程升级结束
 {
   setBusy(false);    //界面退出忙碌态
   if(ok)    //成功时进度补满
@@ -1331,6 +1427,14 @@ void FwBridge::onFlashFinished(bool ok, bool linkBroken, const QString &message)
   if(!linkBroken)    //正常结束时才用传输线程给的状态文字覆盖
   {
     setStatus(message);    //最终状态由传输线程给出
+  }
+
+  if(stoppedWaiting)    //设备已收完数据在自行重建，这段时间内不能发起新一轮升级
+  {
+    //差分包只有一帧时，数据早已全部到达，设备仍在解码并逐页写Flash，
+    //此时再发START_DELTA只会堆在串口缓冲里，不如等它结束并复位
+    m_deviceBusyUntilMs = QDateTime::currentMSecsSinceEpoch() + 60000;    //按最长重建时间留一分钟
+    setStatus(QStringLiteral("设备处理中，请勿断电，约 1 分钟后复位确认版本"));
   }
 
   if(m_flashActive)    //发送阶段结束，日志末尾不再显示进度行
@@ -1350,4 +1454,18 @@ void FwBridge::onFlashFinished(bool ok, bool linkBroken, const QString &message)
     m_closeAfterCancel = false;
     closeConnection();    //此时m_busy已复位，可以正常释放通道
   }
+}
+
+/**
+ * @brief   接收传输线程上报的上传阶段
+ * @param   phase 0发送中、1等设备处理
+ */
+void FwBridge::onFlashPhaseChanged(int phase)
+{
+  if(m_flashPhase == phase)    //只在真正切换时通知界面，避免多余重绘
+  {
+    return;
+  }
+  m_flashPhase = phase;    //记录当前阶段
+  emit flashPhaseChanged();    //界面据此把按钮文字在取消烧录与停止等待之间切换
 }

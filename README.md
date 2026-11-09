@@ -4,7 +4,7 @@
 
 嵌入式固件升级库（目前仅在 STM32L071CZT6 实机验证过）。
 
-**库版本：v2.0.1**。同一版本号维护在 `library/inc/fw_msg.h` 的 `FW_LIB_VERSION`，发布时以本仓库的 Git tag 为准。
+**库版本：v3.0.0**。同一版本号维护在 `library/inc/fw_msg.h` 的 `FW_LIB_VERSION`，发布时以本仓库的 Git tag 为准。
 
 - 支持三种编译期选定的升级方式：覆写、交换、就地执行。组织方式参考 MCUboot，三种方式各占一个源文件，主流程只有一条，不做语句级分叉。
 - 升级过程中需要持久化的数据（升级标志、交换进度、单页暂存）由库内的扇区级磨损均衡 KV（`fw_kv`）承载。这些数据在升级期间会被反复改写，且随时可能掉电，因此 `fw_kv` 采用追加式写入与先搬后擦的 GC，底层读写擦由调用方注入。
@@ -47,12 +47,14 @@
     mkimg/                             发布打包工具，不属于库本身，见第十二节
         mkimg.c                        打包工具源码，只用C标准库，追加镜像元数据生成发布包
         mkimg.exe                      Windows编译产物，供Keil After Build直接调用
-    fwdelta/                           上位机差分生成工具，不属于库本身，见第十四节
-        fw_delta.exe                   已构建的界面程序，不入库，随 Release 附件分发
+    fwdelta/                           上位机工具，不属于库本身，见第十五节
+        bin/fw_delta.exe               已构建的界面程序，不入库，随 Release 附件分发
         fw_delta/                      Qt 工程与界面
             fw_delta.pro               qmake 工程，DESTDIR 指向 ../bin
-            core/                      差分算法与镜像元数据，纯 C++，不依赖 Qt
-            transport/                 传输接口、串口实现、HEX协议上传器
+            app/                       main、FwBridge 桥接、TransportRunner 工作线程
+            core/                      差分算法、镜像元数据、.fwd 打包解析，纯 C++
+            transport/                 传输接口与串口/TCP/UDP 实现、HEX 协议上传器
+            qml/                       main.qml 与自定义控件
             res/                       应用图标与 qrc
 ```
 
@@ -825,9 +827,9 @@ void Start_Task(void *parameter)
 差分包由上位机 GUI 生成，记录流有三种（小端）：
 
 ```
-COPY:    01 | 旧偏移 u16 | 长度 u16
-LITERAL: 02 | 长度 u16 | 数据
-DIFF:    03 | 旧偏移 u16 | 长度 u16 | count u16 | (块内偏移 u16, 差值 u8)*count
+COPY:    01 | 旧偏移 u32 | 长度 u32
+LITERAL: 02 | 长度 u32 | 数据
+DIFF:    03 | 旧偏移 u32 | 长度 u32 | count u16 | (块内偏移 u16, 差值 u8)*count
 ```
 
 - COPY：旧镜像里有完全相同的一块，直接搬；
@@ -847,22 +849,29 @@ DIFF:    03 | 旧偏移 u16 | 长度 u16 | count u16 | (块内偏移 u16, 差值
 
 START_DELTA 携带 `base_crc32` 与 `delta_len`；设备先比对旧镜像元数据里登记的代码 CRC32 校验基版本，不符回 `0x0E`。差分只在 App 构建启用；BL 没有旧镜像可作基，收到 START_DELTA 回 `0x10`。
 
+记录流的偏移与长度都是 32 位，能覆盖 4GB 以内的代码区，不使用任何与槽位大小绑定的字段；镜像能否装进槽位由设备端按自己的 Flash 划分判定，生成端不做假设。`delta_len` 只用于进度和完成判定，设备按流式处理，不预分配缓冲。
+
+这一版把 COPY 与 DIFF 的 `src_off`、以及三种记录的 `len` 从 16 位扩到 32 位，与 2.0.x 生成的 `.fwd` 不互通：换用本版固件后，旧差分包需要重新生成。
+
 ### 14.3 可复现构建
 
 `fw_cfg.h` 的 `FW_BUILD_DATE` 默认取 `__DATE__`；需要跨天可复现时，在工程选项里固定成 `"yyyy-mm-dd"`。同一份源码连续编译两次应得到逐字节一致的 `.bin`，否则先排查时间戳、链接顺序、路径等不确定因素。
 
 ### 14.4 上位机工程结构
 
-`fwdelta/` 是差分生成工具，工程在 `fw_delta/`：
+差分生成与烧录都在 `fwdelta/` 里完成，工程是 `fw_delta/fw_delta.pro`，产物为 `fwdelta/bin/fw_delta.exe`。分层、线程模型、协议层、取消语义与界面实现见 **第十五节**，这里只列目录与构建方式：
 
 ```
-fw_delta/fw_delta.pro   qmake 工程，产物 fw_delta.exe
-fw_delta/core/          差分算法、镜像元数据、.fwd 打包解析，纯 C++
-fw_delta/transport/     传输接口、串口实现、HEX协议上传器
+fw_delta/fw_delta.pro   qmake 工程，DESTDIR 指到 ../bin
+fw_delta/app/           main、FwBridge（QML 单例）、TransportRunner（工作线程执行器）
+fw_delta/core/          镜像元数据、差分算法、.fwd 打包解析，纯 C++、不依赖 Qt
+fw_delta/transport/     IFirmwareTransport 接口与串口/TCP/UDP 实现、HEX 协议上传器
+fw_delta/qml/           main.qml 与自定义控件
 fw_delta/res/           应用图标与 qrc
+fw_delta/tools/         构建后更新 qmltypes 的脚本
 ```
 
-传输层已抽成 `IFirmwareTransport` 接口：`SerialTransport` 是当前串口实现，`FirmwareUploader` 只依赖接口做 HEX 帧、重试和进度。以后加 TCP/HTTP 传输，只需新增一个实现类，界面和协议层都不用改。
+传输层已抽成 `IFirmwareTransport` 接口：`SerialTransport`、`TcpTransport`、`UdpTransport` 各自实现，`FirmwareUploader` 只依赖接口做 HEX 帧、重试和进度。以后加 HTTP 等传输方式，只需新增一个实现类，界面和协议层都不用改。
 
 构建：
 
@@ -896,3 +905,188 @@ mingw32-make -j4
 | `0x0E` | 基版本不符 |
 | `0x0F` | 差分记录流格式/长度错误 |
 | `0x10` | 当前构建不支持差分（BL） |
+
+---
+
+## 十五、上位机：`fw_delta`
+
+上位机不是库的一部分，但它决定了设备端能看到什么。本章按代码实际结构描述：谁在哪个线程跑、一次烧录经过哪些函数、协议帧长什么样、哪些操作是能撤回的。
+
+### 15.1 分层与线程模型
+
+四层，自上而下只依赖下一层的接口：
+
+| 层 | 文件 | 运行线程 | 职责 |
+|---|---|---|---|
+| 界面 | `qml/main.qml`、`qml/*.qml` | GUI 线程 | 只做属性绑定与点击转发，不含业务判断 |
+| 桥接 | `app/fw_bridge.h/.cpp` | GUI 线程 | QML 单例；属性、日志、进度、状态；文件与差分生成调度 |
+| 执行 | `app/transport_runner.h/.cpp` | 工作线程 | 连接生命周期、选包与校验、调用上传器、结果分流 |
+| 协议 | `transport/firmware_uploader.*`、`transport/transport.h` | 工作线程 | HEX 组帧、重试、RESP 解析；字节流读写 |
+
+`core/`（`fw_image`、`fw_delta_codec`、`fw_fwd`）是纯 C++，不引用 Qt，可以被单元测试直接调用。
+
+三条线程：
+
+- **GUI 线程**：`QGuiApplication` 事件循环、QML 渲染、`FwBridge` 的所有槽。界面永不阻塞，所以任何耗时动作都不能在这里同步执行。
+- **传输线程**：`QThread` + `TransportRunner`。打开/关闭连接、轮询设备打印、`runFlash` 的整个发送过程都在这里。`IFirmwareTransport` 对象由这个线程独占，GUI 线程从不直接 touch。
+- **线程池**：`QtConcurrent::run` 执行 `FwBridge::doMakeDelta`。差分生成要几秒到几十秒，放在线程池里，界面期间仍可响应。
+
+跨线程只走信号槽（`Qt::AutoConnection` 自动排队）与两个原子量：`m_cancelRequested`（GUI 写、传输线程读）、`m_cancelFlag`（同）。
+
+```cpp
+// FwBridge 构造里把三条线程接起来
+connect(m_runner, &TransportRunner::flashFinished, this, &FwBridge::onFlashFinished);
+connect(m_runner, &TransportRunner::flashPhaseChanged, this, &FwBridge::onFlashPhaseChanged);
+```
+
+### 15.2 模块职责
+
+| 文件 | 职责 |
+|---|---|
+| `app/main.cpp` | 创建 `QGuiApplication`，设置 Material 风格，加载中文翻译，把 `FwBridge` 注册成 QML 单例，加载 `qrc:/qml/main.qml` |
+| `app/fw_bridge.h/.cpp` | QML 单例。属性读写、日志缓冲与裁剪、进度行拼装、连接生命周期、差分生成入口 |
+| `app/transport_runner.h/.cpp` | 工作线程执行器。`openConnection`/`closeConnection`/`runFlash`/`pollText`；读固件、剥元数据、校验差分包、按结果分流 |
+| `transport/transport.h` | `IFirmwareTransport` 纯接口：`open`/`close`/`write`/`read`/`poll`/`clientList`/`setClient` |
+| `transport/serial_transport.*` | `QSerialPort` 实现，默认 8N1、无流控；设备被拔出时置 `linkBroken`，后续读写都按链路失效处理 |
+| `transport/tcp_transport.*` | `QTcpServer`/`QTcpSocket` 双模式，服务器模式维护 `ClientInfo` 列表（IP、端口、上线时间） |
+| `transport/udp_transport.*` | `QUdpSocket` 双模式，服务器模式记录最近一次来源地址并回复该地址 |
+| `transport/firmware_uploader.*` | HEX 组帧、按 256 字节分帧、逐帧重试、RESP 解析、末帧长超时、取消检查 |
+| `core/fw_image.*` | 64 字节镜像元数据：CRC16/CRC32、`build_meta`、`parse_meta`、`strip_embedded_meta`、`inspect_meta_file` |
+| `core/fw_delta_codec.*` | CDC 与固定分块各算一遍取小、COPY/LITERAL/DIFF 三种记录、生成后本地回放校验、`apply_delta` |
+| `core/fw_fwd.*` | `.fwd` 差分包文件格式的打包与解析 |
+
+`transport.h` 是关键约定：接口只管字节流，不知道 HEX 帧、不知道差分、不知道升级阶段。所以 `FirmwareUploader` 换一个传输实现不用改一行，而新增一种传输也不用碰协议层。
+
+### 15.3 一次烧录的数据流
+
+| 步骤 | 触发 | 执行者 | 结果 |
+|---|---|---|---|
+| 1 | 点「打开」 | GUI → 传输线程 | `FwBridge::openConnection` 按类型 new 出传输对象，`open()` 成功后发 `openFinished`，状态栏显示「已连接」 |
+| 2 | 选固件 | GUI 线程 | `inspectFirmware` 只读文件尾 64 字节，立刻显示版本、水印、大小，不加载整个文件 |
+| 3 | 点「生成差分」 | GUI → 线程池 | `doMakeDelta` 读新旧两份代码区，生成并本地回放校验，通过后写 `.fwd`，发 `deltaStatsChanged` |
+| 4 | 点「开始烧录」 | GUI 线程 | `startFlash` 校验忙状态、连接状态、设备忙窗口，`setBusy(true)` 后把任务投递到传输线程 |
+| 5 | 发送 | 传输线程 | `runFlash`：读新固件 → 剥元数据 → 校验差分包 → `FirmwareUploader` 逐帧发送 |
+| 6 | 收尾 | 传输线程 → GUI | `finish()` 发 `flashFinished`，`FwBridge::onFlashFinished` 复位忙状态、写最终状态文字 |
+
+第 5 步里 `runFlash` 的判定顺序值得单独看，因为它决定了"发什么"：
+
+```cpp
+const int stripResult = fw::strip_embedded_meta(code, embedded);
+if(stripResult == 0)    //纯代码bin没有版本与水印来源，直接拒绝
+{
+  postLog(QStringLiteral("该文件不含镜像元数据，请选择发布包（Converter.pkg.bin）"));
+  finish(false, QStringLiteral("固件缺少镜像元数据"));
+  return;
+}
+```
+
+纯 `.bin` 一律拒绝：没有镜像元数据就没有版本号和水印，设备端无法据此判定"这版比现在新还是旧"。要发就发 `mkimg` 打出来的 `.pkg.bin`。
+
+### 15.4 HEX 协议层
+
+每帧 9 字节头加载荷再加 2 字节 CRC16（Modbus，覆盖 SOF 到载荷末尾）：
+
+| 偏移 | 长度 | 字段 |
+|---|---|---|
+| 0 | 2 | SOF，固定 `55 AA` |
+| 2 | 1 | 高 4 位协议版本（1），低 4 位帧类型 |
+| 3 | 4 | 本帧在代码区或记录流中的偏移，小端 |
+| 7 | 2 | 载荷长度，小端 |
+| 9 | N | 载荷 |
+| 9+N | 2 | CRC16，覆盖前面全部字节 |
+
+帧类型：`0` START（载荷是 64 字节镜像元数据）、`1` DATA、`2` RESP（载荷 1 字节状态码）、`3` START_DELTA（载荷是元数据 + `base_crc32` + `delta_len`）。
+
+发送方式是最简单的**同步停等**：发一帧，等对应的 RESP，收到再发下一帧。代价是每帧一次往返，44024 字节要 172 帧、约 43 秒；好处是设备端不需要接收窗口，也不需要处理乱序与重传窗口。`readResp` 用累积缓冲跨调用保留，超时后才到的半帧能与下一段拼成完整帧，不必整帧重发；其中残留的旧应答按偏移比对丢弃。
+
+超时与重试：单帧 3 秒、最多 3 次（`kRespTimeoutMs`、`kRetryMax`）。差分记录流的末帧是例外——设备收到末帧后才开始解码并逐页写 Flash，耗时与镜像大小成正比，所以按 60 秒、2 次等待（`kDeltaFinishTimeoutSec`、`kDeltaFinishRetry`）。设备端对"帧尾正好落在写入前沿"的重传直接回 OK、不重复解析，末帧才敢重发。
+
+### 15.5 选包：差分还是整包
+
+填了差分包路径不等于一定会发差分。`runFlash` 依次检查，任何一条不满足就退回整包，而不是让升级失败：
+
+| 检查 | 不满足时的处理 |
+|---|---|
+| `.fwd` 存在且能解析 | 记一行日志，改发整包 |
+| 记录流不超过新固件代码的 60% | 记「差分率超过 60%，改发整包」，改发整包 |
+| 差分包的 `image_len`、`image_ver`、`project_id`、`code_crc32` 与新固件一致 | 记「差分包与新固件不匹配，改发整包」，改发整包 |
+| 设备接受 START_DELTA | 回 `0x0E`（基版本不符）、`0x0F`（格式错）、`0x10`（BL 不支持）都改发整包 |
+| 链路本身正常 | 链路已断时不回退——整包也发不出去，直接报失败 |
+
+`code_crc32` 这条是必须的：版本号和长度都可能相同而内容不同，只有 CRC 能证明"这个差分包确实是给这份新固件用的"。同理，发送前会把实际采用的方式写进日志，避免操作者不清楚发的是哪一种：
+
+```
+本次发送：差分升级，差分包 55 字节，差分率 0.13%，总帧数：1
+本次发送：整包升级，代码 43960 字节 + 镜像元数据 64 字节
+```
+
+### 15.6 取消：能停的与停不了的
+
+这是上位机语义里最容易误解的一处，所以单独说明。
+
+发送过程分两个阶段，由 `FirmwareUploader::Phase` 标记并经 `flashPhaseChanged` 送到界面：
+
+| 阶段 | 判据 | 按钮文字 | 点下去的实际效果 |
+|---|---|---|---|
+| `kPhaseSending` = 0 | 还有数据帧没发 | 取消烧录 | 最迟一帧（约 0.25 秒）内停住，界面与日志显示「已取消」 |
+| `kPhaseWaitDevice` = 1 | 末帧已发出，在等设备应答 | 停止等待 | 数据已全部到达设备，**撤不回**；只停止等待，界面显示「设备处理中」 |
+
+第二阶段的被动是设备端造成的：`library/src/fw_iap.c` 在末帧到达时同步调用 `fw_iap_hex_delta_finish()`，里面依次做解码全部记录、逐页写 Flash、写镜像元数据、校验、提交升级标志、回 RESP。整段是阻塞的，不读串口、不查任何取消标志，协议里也没有 ABORT 帧（帧类型只有 `START`/`DATA`/`RESP`/`START_DELTA`）。
+
+差分包恰好把这个问题放到最大：一份 55 字节的差分包只占 1 帧，点下开始后约 0.4 秒数据就全到了，剩下 37 秒都在等设备。整包 172 帧，只要不是最后一帧，取消都还能真实生效。
+
+因此上位机做了三件事：
+
+1. **按钮与提示随阶段切换**。`main.qml` 的 `startBtn` 绑定 `FwBridge.flashPhase`，阶段为 1 时文字变「停止等待」，tooltip 明确写"撤不回本次升级，此间不要断电"。
+2. **结果文案不再谎称已取消**。`TransportRunner` 按 `result.waitingDevice` 分流：真取消记「已取消升级」、状态「已取消」；停止等待记「已停止等待：设备仍在重建镜像并提交，此间不要断电，完成后复位确认版本」、状态「设备处理中」。
+3. **停止等待后留一个 60 秒的设备忙窗口**。`FwBridge` 记 `m_deviceBusyUntilMs`，窗口内点「开始烧录」直接拒绝并提示先复位设备——否则新的 START_DELTA 会堆在串口缓冲里，等设备重建完才被读到，行为不可预测。
+
+要做成"真取消"需要：协议新增 ABORT 帧，固件在解码与写 Flash 的每一页回调里查串口，并且重新分析"解除升级到一半掉电"的行为。这属于固件改动，当前版本没有做。
+
+### 15.7 日志
+
+日志按来源分四类，颜色由 `FwBridge::logColor` 给出：
+
+| 常量 | 来源 | 颜色 | 典型内容 |
+|---|---|---|---|
+| `kLogHost` | 上位机自身 | 灰 | `串口已打开: COM5`、`本次发送：差分升级…` |
+| `kLogDevice` | 设备上行打印 | 深色 | `[BL] Update(swap) 30%`、`[APP] App V1.0.4` |
+| `kLogSuccess` | 成功结果 | 绿 | `升级成功，设备已提交…` |
+| `kLogError` | 失败与错误 | 红 | `升级失败: 设备端重建镜像超时` |
+
+两个实现细节：
+
+- **进度行不进历史**。发送期间末尾两行（帧号 `帧 12/172` 与百分比）由 `progressLines()` 实时拼在 `logText()` 末尾，不写进 `m_logText`。`logBodyLength` 给出正文长度，界面只替换末尾，避免每 256 字节就整段重绘。
+- **总量有上限**。累计超过 2000 行时 `trimLog()` 丢掉最老的一批，长时间运行不会越用越卡。导出走 `plainLogText`，得到不带颜色标记的纯文本。
+
+设备打印与协议帧共用同一条字节流，`pollPassive` 每 200 毫秒取一次并交给 `flushText` 按行解码；升级期间定时器停掉，避免与发送争用通道。
+
+### 15.8 传输方式
+
+| 方式 | 客户端模式 | 服务器模式 | 说明 |
+|---|---|---|---|
+| 串口 | 打开指定 COM 口 | — | 默认 8N1、无流控，参数由界面传入 |
+| TCP | 主动连接 host:port | 监听端口，列表显示已连客户端 | 服务器模式可切换当前客户端 |
+| UDP | 发往 host:port | 绑定端口，回复最近来源 | 无连接语义，靠设备端超时重传 |
+
+三种实现都不做粘包处理——分帧交给 `FirmwareUploader::readResp`，它按 `55 AA` 与长度字段从字节流里切帧。
+
+### 15.9 构建与部署
+
+构建命令见 12.1 与 14.4。实际验证过的一组命令（Qt 6.12.0 MinGW 64 位）：
+
+```powershell
+$env:PATH="D:\Qt\Qt6\Tools\mingw1310_64\bin;D:\Qt\Qt6\6.12.0\mingw_64\bin;"+$env:PATH
+cd fw_delta\build\Desktop_Qt_6_12_0_MinGW_64_bit_Release
+mingw32-make -f Makefile.Release -j4
+```
+
+产物直接覆盖 `fwdelta/bin/fw_delta.exe`。`bin/` 目录里只放 exe，Qt DLL 由 `windeployqt` 部署到同目录，启动时必须能找到 Qt 的 `bin`（或已部署完整）。
+
+### 15.10 已知限制
+
+- 同步停等：每帧一次往返，速率受设备端 RESP 延迟限制，与波特率关系不大。
+- 差分只在 App 构建有效；BL 收到 START_DELTA 回 `0x10`，上位机自动回退整包。
+- 取消在等设备阶段只能停止等待，原因见 15.6。
+- 日志上限 2000 行，超长会话的早期内容会被裁掉；需要留存时用「导出」。
+- 差分包与新固件的匹配靠 `image_ver` + `project_id` + `code_crc32`，三者都一致才发送；换构建参数但版本号没变时，CRC 会拦住不匹配的差分包。

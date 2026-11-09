@@ -120,9 +120,9 @@ std::vector<Op> diff_chunks(const std::vector<uint8_t> &old_code,
     index[key].push_back(c.first);                   //登记该块在旧镜像中的起始偏移
   }
   //旧镜像建"窗口哈希 -> 偏移"索引
-  for(uint32_t off = 0u; off + kWin <= old_code.size(); off++)  //窗口在旧镜像内逐字节滑动
+  for(std::size_t off = 0u; off + kWin <= old_code.size(); off++)  //窗口在旧镜像内逐字节滑动，用64位下标避免末尾回绕
   {
-    win_index[crc32(old_code.data() + off, kWin)].push_back(off);  //按窗口CRC登记起始偏移
+    win_index[crc32(old_code.data() + off, kWin)].push_back(static_cast<uint32_t>(off));  //按窗口CRC登记起始偏移
   }
 
   std::vector<Op> ops;  //新镜像的记录列表
@@ -213,7 +213,7 @@ std::vector<Op> diff_chunks(const std::vector<uint8_t> &old_code,
         ops.push_back(std::move(op));                //加入记录列表
         found = true;                                //标记本块已编码
       }
-      else if(best_count != 0xFFFFFFFFu && (7u + 3u * best_count) < (3u + len))  //DIFF编码长度必须小于LITERAL
+      else if(best_count != 0xFFFFFFFFu && (11u + 3u * best_count) < (5u + len))  //DIFF编码长度必须小于LITERAL
       {
         Op op;  //待填充的DIFF记录
         op.type = kOpDiff;                           //按DIFF记录编码
@@ -251,7 +251,7 @@ std::vector<Op> diff_chunks(const std::vector<uint8_t> &old_code,
 std::vector<Op> merge_ops(std::vector<Op> ops, uint32_t literal_merge_max)
 {
   std::vector<Op> out;  //合并后的记录列表
-  const uint32_t merge_max = std::min<uint32_t>(literal_merge_max, 0xFFFFu);  //LITERAL长度字段只有16位
+  const uint32_t merge_max = literal_merge_max;  //LITERAL合并上限由调用方决定
 
   for(auto &op : ops)                                //按顺序处理每条记录
   {
@@ -259,7 +259,7 @@ std::vector<Op> merge_ops(std::vector<Op> ops, uint32_t literal_merge_max)
     {
       if(!out.empty() && out.back().type == kOpCopy  //与上一条同为COPY才可能合并
          && out.back().src + out.back().len == op.src
-         && out.back().len + op.len <= 0xFFFFu)      //与上一条首尾相接且长度不超16位上限
+         && static_cast<uint64_t>(out.back().len) + op.len <= 0xFFFFFFFFu)  //首尾相接且合并后长度不溢出32位
       {
         out.back().len += op.len;                    //并入上一条，节省一条记录头
         continue;                                    //本记录已处理完
@@ -269,7 +269,7 @@ std::vector<Op> merge_ops(std::vector<Op> ops, uint32_t literal_merge_max)
     else if(op.type == kOpLiteral)                   //当前是LITERAL记录
     {
       if(!out.empty() && out.back().type == kOpLiteral
-         && out.back().data.size() + op.data.size() <= merge_max)  //合并后不超16位长度上限
+         && out.back().data.size() + op.data.size() <= merge_max)  //合并后不超merge_max
       {
         out.back().data.insert(out.back().data.end(), op.data.begin(), op.data.end());  //追加数据
         out.back().len = static_cast<uint32_t>(out.back().data.size());  //同步更新长度字段
@@ -295,30 +295,40 @@ std::vector<uint8_t> serialize_ops(const std::vector<Op> &ops)
 
   for(const auto &op : ops)                          //逐条序列化记录
   {
-    if(op.type == kOpCopy)                           //COPY：type + src(2) + len(2)
+    if(op.type == kOpCopy)                           //COPY：type + src(4) + len(4)
     {
       out.push_back(kOpCopy);                        //记录类型
-      out.push_back(static_cast<uint8_t>(op.src & 0xFFu));          //源偏移低字节
-      out.push_back(static_cast<uint8_t>((op.src >> 8) & 0xFFu));   //源偏移高字节
-      out.push_back(static_cast<uint8_t>(op.len & 0xFFu));          //长度低字节
-      out.push_back(static_cast<uint8_t>((op.len >> 8) & 0xFFu));   //长度高字节
+      out.push_back(static_cast<uint8_t>(op.src & 0xFFu));          //源偏移第0字节
+      out.push_back(static_cast<uint8_t>((op.src >> 8) & 0xFFu));   //源偏移第1字节
+      out.push_back(static_cast<uint8_t>((op.src >> 16) & 0xFFu));  //源偏移第2字节
+      out.push_back(static_cast<uint8_t>((op.src >> 24) & 0xFFu));  //源偏移第3字节
+      out.push_back(static_cast<uint8_t>(op.len & 0xFFu));          //长度第0字节
+      out.push_back(static_cast<uint8_t>((op.len >> 8) & 0xFFu));   //长度第1字节
+      out.push_back(static_cast<uint8_t>((op.len >> 16) & 0xFFu));  //长度第2字节
+      out.push_back(static_cast<uint8_t>((op.len >> 24) & 0xFFu));  //长度第3字节
     }
-    else if(op.type == kOpLiteral)                   //LITERAL：type + len(2) + 数据
+    else if(op.type == kOpLiteral)                   //LITERAL：type + len(4) + 数据
     {
       out.push_back(kOpLiteral);                     //记录类型
-      out.push_back(static_cast<uint8_t>(op.len & 0xFFu));          //长度低字节
-      out.push_back(static_cast<uint8_t>((op.len >> 8) & 0xFFu));   //长度高字节
+      out.push_back(static_cast<uint8_t>(op.len & 0xFFu));          //长度第0字节
+      out.push_back(static_cast<uint8_t>((op.len >> 8) & 0xFFu));   //长度第1字节
+      out.push_back(static_cast<uint8_t>((op.len >> 16) & 0xFFu));  //长度第2字节
+      out.push_back(static_cast<uint8_t>((op.len >> 24) & 0xFFu));  //长度第3字节
       out.insert(out.end(), op.data.begin(), op.data.end());        //原样数据
     }
     else
     {
-      //DIFF：src + len + count + (pos,val)*count
-      uint16_t count = static_cast<uint16_t>(op.pos.size());  //差异点个数
+      //DIFF：src(4) + len(4) + count(2) + (pos,val)*count
+      uint16_t count = static_cast<uint16_t>(op.pos.size());  //差异点个数，块长不超过128
       out.push_back(kOpDiff);                        //记录类型
-      out.push_back(static_cast<uint8_t>(op.src & 0xFFu));          //基块偏移低字节
-      out.push_back(static_cast<uint8_t>((op.src >> 8) & 0xFFu));   //基块偏移高字节
-      out.push_back(static_cast<uint8_t>(op.len & 0xFFu));          //覆盖长度低字节
-      out.push_back(static_cast<uint8_t>((op.len >> 8) & 0xFFu));   //覆盖长度高字节
+      out.push_back(static_cast<uint8_t>(op.src & 0xFFu));          //基块偏移第0字节
+      out.push_back(static_cast<uint8_t>((op.src >> 8) & 0xFFu));   //基块偏移第1字节
+      out.push_back(static_cast<uint8_t>((op.src >> 16) & 0xFFu));  //基块偏移第2字节
+      out.push_back(static_cast<uint8_t>((op.src >> 24) & 0xFFu));  //基块偏移第3字节
+      out.push_back(static_cast<uint8_t>(op.len & 0xFFu));          //覆盖长度第0字节
+      out.push_back(static_cast<uint8_t>((op.len >> 8) & 0xFFu));   //覆盖长度第1字节
+      out.push_back(static_cast<uint8_t>((op.len >> 16) & 0xFFu));  //覆盖长度第2字节
+      out.push_back(static_cast<uint8_t>((op.len >> 24) & 0xFFu));  //覆盖长度第3字节
       out.push_back(static_cast<uint8_t>(count & 0xFFu));           //差异点个数低字节
       out.push_back(static_cast<uint8_t>((count >> 8) & 0xFFu));    //差异点个数高字节
       for(std::size_t i = 0; i < op.pos.size(); i++)                //逐个输出差异点
@@ -409,6 +419,11 @@ bool apply_delta_stream(const std::vector<uint8_t> &old_code,
                         uint32_t code_len,
                         std::vector<uint8_t> &out)
 {
+  constexpr uint32_t kMaxCodeLen = 16u * 1024u * 1024u;    //代码区上限，防止异常长度触发巨型分配
+  if(code_len == 0u || code_len > kMaxCodeLen)             //长度来自外部文件，先做范围检查
+  {
+    return false;                                      //为空或超出上限时按失败返回
+  }
   out.clear();                                       //清空输出，从空代码区开始拼装
   out.reserve(code_len);                             //按期望长度预留空间
 
@@ -419,15 +434,19 @@ bool apply_delta_stream(const std::vector<uint8_t> &old_code,
 
     if(type == kOpCopy)                              //COPY：从旧镜像按偏移拷贝
     {
-      if(pos + 4 > payload.size())                   //剩余数据不足src与len字段
+      if(pos + 8 > payload.size())                   //剩余数据不足src与len字段
       {
         return false;                                //记录流截断
       }
-      uint32_t src = static_cast<uint32_t>(payload[pos])              //源偏移低字节
-                   | (static_cast<uint32_t>(payload[pos + 1]) << 8);  //源偏移高字节
-      uint32_t len = static_cast<uint32_t>(payload[pos + 2])          //长度低字节
-                   | (static_cast<uint32_t>(payload[pos + 3]) << 8);  //长度高字节
-      pos += 4;                                      //跳过src与len字段
+      uint32_t src = static_cast<uint32_t>(payload[pos])               //源偏移第0字节
+                   | (static_cast<uint32_t>(payload[pos + 1]) << 8)    //源偏移第1字节
+                   | (static_cast<uint32_t>(payload[pos + 2]) << 16)   //源偏移第2字节
+                   | (static_cast<uint32_t>(payload[pos + 3]) << 24);  //源偏移第3字节
+      uint32_t len = static_cast<uint32_t>(payload[pos + 4])           //长度第0字节
+                   | (static_cast<uint32_t>(payload[pos + 5]) << 8)    //长度第1字节
+                   | (static_cast<uint32_t>(payload[pos + 6]) << 16)   //长度第2字节
+                   | (static_cast<uint32_t>(payload[pos + 7]) << 24);  //长度第3字节
+      pos += 8;                                      //跳过src与len字段
       if(len == 0 || static_cast<uint64_t>(src) + len > old_code.size())  //长度非法或源区间越界
       {
         return false;                                //拒绝越界拷贝
@@ -440,13 +459,15 @@ bool apply_delta_stream(const std::vector<uint8_t> &old_code,
     }
     else if(type == kOpLiteral)                      //LITERAL：直接追加携带的数据
     {
-      if(pos + 2 > payload.size())                   //剩余数据不足len字段
+      if(pos + 4 > payload.size())                   //剩余数据不足len字段
       {
         return false;                                //记录流截断
       }
-      uint32_t len = static_cast<uint32_t>(payload[pos])              //长度低字节
-                   | (static_cast<uint32_t>(payload[pos + 1]) << 8);  //长度高字节
-      pos += 2;                                      //跳过len字段
+      uint32_t len = static_cast<uint32_t>(payload[pos])               //长度第0字节
+                   | (static_cast<uint32_t>(payload[pos + 1]) << 8)    //长度第1字节
+                   | (static_cast<uint32_t>(payload[pos + 2]) << 16)   //长度第2字节
+                   | (static_cast<uint32_t>(payload[pos + 3]) << 24);  //长度第3字节
+      pos += 4;                                      //跳过len字段
       if(len == 0 || pos + len > payload.size())     //长度为0或数据段越界
       {
         return false;                                //拒绝非法长度
@@ -460,17 +481,21 @@ bool apply_delta_stream(const std::vector<uint8_t> &old_code,
     }
     else if(type == kOpDiff)                         //DIFF：拷贝基块后按差异点修正
     {
-      if(pos + 6 > payload.size())                   //剩余数据不足源偏移、长度与差异点个数
+      if(pos + 10 > payload.size())                  //剩余数据不足源偏移、长度与差异点个数
       {
         return false;                                //记录流截断
       }
-      uint32_t src = static_cast<uint32_t>(payload[pos])              //基块偏移低字节
-                   | (static_cast<uint32_t>(payload[pos + 1]) << 8);  //基块偏移高字节
-      uint32_t len = static_cast<uint32_t>(payload[pos + 2])          //覆盖长度低字节
-                   | (static_cast<uint32_t>(payload[pos + 3]) << 8);  //覆盖长度高字节
-      uint32_t count = static_cast<uint32_t>(payload[pos + 4])        //差异点个数低字节
-                     | (static_cast<uint32_t>(payload[pos + 5]) << 8);  //差异点个数高字节
-      pos += 6;                                      //跳过上述字段
+      uint32_t src = static_cast<uint32_t>(payload[pos])               //基块偏移第0字节
+                   | (static_cast<uint32_t>(payload[pos + 1]) << 8)    //基块偏移第1字节
+                   | (static_cast<uint32_t>(payload[pos + 2]) << 16)   //基块偏移第2字节
+                   | (static_cast<uint32_t>(payload[pos + 3]) << 24);  //基块偏移第3字节
+      uint32_t len = static_cast<uint32_t>(payload[pos + 4])           //覆盖长度第0字节
+                   | (static_cast<uint32_t>(payload[pos + 5]) << 8)    //覆盖长度第1字节
+                   | (static_cast<uint32_t>(payload[pos + 6]) << 16)   //覆盖长度第2字节
+                   | (static_cast<uint32_t>(payload[pos + 7]) << 24);  //覆盖长度第3字节
+      uint32_t count = static_cast<uint32_t>(payload[pos + 8])         //差异点个数低字节
+                     | (static_cast<uint32_t>(payload[pos + 9]) << 8); //差异点个数高字节
+      pos += 10;                                     //跳过上述字段
       if(len == 0 || len > kDiffMax || count > len)  //长度越界或差异点数量超过块长
       {
         return false;                                //拒绝非法字段
@@ -533,10 +558,9 @@ DeltaPack make_delta(const std::vector<uint8_t> &old_code,
   {
     return pack;                                     //返回空payload表示失败
   }
-  //COPY的src/len与LITERAL的len都只有16位，记录流里能引用的旧代码最长64KB；
+  //记录流的偏移与长度都是32位，能覆盖4GB以内的代码区；
   //镜像能否装进槽位由设备端按自己的Flash划分判定，这里不做假设
-  const uint32_t max_code_len = 0x10000u;
-  if(new_code.size() > max_code_len || old_code.size() > max_code_len
+  if(new_code.size() > 0xFFFFFFFFu || old_code.size() > 0xFFFFFFFFu
      || new_code.size() < 8u || old_code.size() < 8u)      //设备端同样要求代码长度不小于8字节
   {
     return pack;                                     //超出可编码范围或低于设备端下限，按失败返回
@@ -610,10 +634,6 @@ bool apply_delta(const std::vector<uint8_t> &old_code,
     return false;                                    //旧镜像不是该差分包对应的基版本
   }
   uint32_t code_len = pack.meta.image_len - kImgMetaLen;  //由镜像总长推出代码区长度
-  if(code_len > 0xFFFFu)                             //设备端记录长度字段只有16位
-  {
-    return false;                                    //超出协议可还原范围
-  }
   if(!apply_delta_stream(old_code, pack.payload, code_len, out))  //按记录流拼装新代码区
   {
     return false;                                    //记录流非法或长度不符

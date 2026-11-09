@@ -137,6 +137,13 @@ void fw_port_irq_disable(void);
 */
 void fw_port_irq_enable(void);
 
+/**
+* @brief   整机软复位
+* @note    无法安全跳转时用它退回BootLoader重新选择镜像，代替关中断死等。
+*          本函数不返回。
+*/
+void fw_port_system_reset(void);
+
 /* ==================== 日志与复位原因(App与BootLoader都要用) ==================== */
 
 /* 一行日志的最大字节数(含结尾的\r\n)，即平台层行缓冲大小。

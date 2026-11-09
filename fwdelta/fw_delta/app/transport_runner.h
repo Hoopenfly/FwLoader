@@ -43,7 +43,9 @@ signals:
   void framesChanged(uint32_t frameCurrent, uint32_t frameTotal);         //已发送帧号与总帧数
   void statusText(const QString &text);                                   //状态文字变化
   void logText(const QString &text);                                      //新增一行日志
-  void flashFinished(bool ok, bool linkBroken, const QString &message);    //升级流程结束，linkBroken表示链路已断
+  void flashPhaseChanged(int phase);                                      //上传阶段变化，0发送中、1等设备处理
+  void flashFinished(bool ok, bool linkBroken, bool stoppedWaiting,
+                     const QString &message);                             //升级流程结束，stoppedWaiting表示设备仍在自处理
   void rawBytes(const QByteArray &bytes);                                 //收到设备主动发来的原始字节
   void linkLost(const QString &reason);                                   //链路已断开，需要界面复位连接状态
 

@@ -287,8 +287,7 @@ static int fw_swap_recover(void)
     int do_full = 0;//是否需要执行完整交换
     int do_finish = 0;//是否只需完成Scratch -> SLOT1
     //读取暂存：若暂存属于当前page，boot_page_buf即为暂存的页数据
-    int scratch_ok = (fw_swap_scratch_kv_load(page));
-    if(!scratch_ok)
+    if(fw_swap_scratch_kv_load(page) != 0)
     {
       //暂存为空或属于其他页：当前页尚未开始
       do_full = 1;

@@ -79,8 +79,10 @@ bool TcpTransport::open(QString &error)
   if(!clientSocket.waitForConnected(3000))    //最多等3秒完成TCP握手
   {
     error = clientSocket.errorString();    //把连接失败原因交给调用方
+    clientSocket.abort();    //中止残留的握手，避免套接字停在ConnectingState
     return false;
   }
+  clientSocket.setSocketOption(QAbstractSocket::LowDelayOption, 1);    //关闭Nagle，升级应答不能攒包
   active = &clientSocket;    //连接建立后作为当前通信目标
   return true;
 }
@@ -142,9 +144,11 @@ void TcpTransport::removeClient(QTcpSocket *socket)
       }
     }
 
-    if(active == socket)    //断开的是当前通信目标时需要改选
+    if(active == socket)    //断开的是当前通信目标时必须置空
     {
-      active = clients.isEmpty() ? nullptr : clients.first().socket;    //有客户端则切换，否则置空
+      /* 不自动切到列表里的其它客户端：那样下一次烧录会打到另一块板子上，
+         操作者以为还在升级刚才那台。断开后由界面提示重新选择目标 */
+      active = nullptr;
     }
   }
 
@@ -292,14 +296,21 @@ bool TcpTransport::write(const uint8_t *data, std::size_t len)
   }
   const qint64 written = socket->write(reinterpret_cast<const char *>(data),
                                        static_cast<qint64>(len));    //按Qt接口的长度类型写入原始字节
-  if(written != static_cast<qint64>(len))    //写入长度不足说明发送失败
+  std::size_t sent = (written > 0) ? static_cast<std::size_t>(written) : 0u;    //已写入的字节数
+  while(sent < len)    //TCP写可能只写出一部分，必须续写剩余字节
   {
-    return false;
-  }
-  //等待数据交给系统协议栈；个别平台会误报超时，因此只在仍有数据没发出去时才判定失败
-  if(!socket->waitForBytesWritten(1000) && socket->bytesToWrite() > 0)
-  {
-    return false;    //等待失败且发送缓冲仍未清空，按发送失败处理
+    const qint64 n = socket->write(reinterpret_cast<const char *>(data) + sent,
+                                   static_cast<qint64>(len - sent));    //从断点继续写
+    if(n <= 0)    //写入失败
+    {
+      return false;
+    }
+    sent += static_cast<std::size_t>(n);    //累加已写入长度
+    //等待数据交给系统协议栈；个别平台会误报超时，因此只在仍有数据没发出去时才判定失败
+    if(!socket->waitForBytesWritten(1000) && socket->bytesToWrite() > 0)
+    {
+      return false;    //等待失败且发送缓冲仍未清空，按发送失败处理
+    }
   }
   return true;
 }

@@ -19,6 +19,16 @@ static uint16_t fw_delta_rd_u16(const uint8_t *p)
 }
 
 /**
+* @brief   读小端32位
+* @param   p  数据指针
+* @return  读到的值
+*/
+static uint32_t fw_delta_rd_u32(const uint8_t *p)
+{
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/**
 * @brief   把输出缓冲交给write回调
 * @param   ctx  解码器上下文
 * @return  FW_DELTA_OK或负错误码
@@ -71,25 +81,23 @@ int fw_delta_init(fw_delta_ctx_t *ctx, uint32_t code_len, uint32_t old_len,
 */
 static int fw_delta_parse_hdr(fw_delta_ctx_t *ctx)
 {
-  uint32_t end;
-
   if(ctx->op == FW_DELTA_OP_COPY)
   {
-    ctx->src = fw_delta_rd_u16(ctx->hdr);
-    ctx->remain = fw_delta_rd_u16(ctx->hdr + 2u);
+    ctx->src = fw_delta_rd_u32(ctx->hdr);
+    ctx->remain = fw_delta_rd_u32(ctx->hdr + 4u);
     if(ctx->remain == 0u)
     {
       return FW_DELTA_ERR_FORMAT;
     }
-    //源区间必须在旧镜像内
-    if((uint32_t)ctx->src + (uint32_t)ctx->remain > ctx->old_len)
+    //源区间必须在旧镜像内，用减法避免src+remain溢出
+    if(ctx->src > ctx->old_len || ctx->remain > (ctx->old_len - ctx->src))
     {
       return FW_DELTA_ERR_RANGE;
     }
   }
   else if(ctx->op == FW_DELTA_OP_LITERAL)
   {
-    ctx->remain = fw_delta_rd_u16(ctx->hdr);
+    ctx->remain = fw_delta_rd_u32(ctx->hdr);
     if(ctx->remain == 0u)
     {
       return FW_DELTA_ERR_FORMAT;
@@ -98,9 +106,9 @@ static int fw_delta_parse_hdr(fw_delta_ctx_t *ctx)
   else
   {
     //DIFF：src + len + count，块长受输出缓冲限制
-    ctx->src = fw_delta_rd_u16(ctx->hdr);
-    ctx->remain = fw_delta_rd_u16(ctx->hdr + 2u);
-    ctx->diff_left = fw_delta_rd_u16(ctx->hdr + 4u);
+    ctx->src = fw_delta_rd_u32(ctx->hdr);
+    ctx->remain = fw_delta_rd_u32(ctx->hdr + 4u);
+    ctx->diff_left = fw_delta_rd_u16(ctx->hdr + 8u);
     ctx->diff_started = 0u;
     ctx->diff_have = 0u;
     if(ctx->remain == 0u || ctx->remain > FW_DELTA_BUF_SIZE)
@@ -112,16 +120,18 @@ static int fw_delta_parse_hdr(fw_delta_ctx_t *ctx)
     {
       return FW_DELTA_ERR_FORMAT;
     }
-    if((uint32_t)ctx->src + (uint32_t)ctx->remain > ctx->old_len)
+    if(ctx->src > ctx->old_len || ctx->remain > (ctx->old_len - ctx->src))
     {
       return FW_DELTA_ERR_RANGE;
     }
   }
   //当前记录连同缓冲里未交出的数据，都不能超过目标代码长度
-  end = ctx->out_len + (uint32_t)ctx->out_fill + (uint32_t)ctx->remain;
-  if(end > ctx->code_len)
   {
-    return FW_DELTA_ERR_RANGE;
+    uint32_t used = ctx->out_len + (uint32_t)ctx->out_fill;
+    if(used > ctx->code_len || ctx->remain > (ctx->code_len - used))
+    {
+      return FW_DELTA_ERR_RANGE;
+    }
   }
   return FW_DELTA_OK;
 }
@@ -156,15 +166,15 @@ int fw_delta_feed(fw_delta_ctx_t *ctx, const uint8_t *data, uint32_t len)
       len--;
       if(op == FW_DELTA_OP_COPY)
       {
-        ctx->hdr_need = 4u;
+        ctx->hdr_need = 8u;
       }
       else if(op == FW_DELTA_OP_LITERAL)
       {
-        ctx->hdr_need = 2u;
+        ctx->hdr_need = 4u;
       }
       else if(op == FW_DELTA_OP_DIFF)
       {
-        ctx->hdr_need = 6u;
+        ctx->hdr_need = 10u;
       }
       else
       {
@@ -230,7 +240,7 @@ int fw_delta_feed(fw_delta_ctx_t *ctx, const uint8_t *data, uint32_t len)
       }
       ctx->src += n;
       ctx->out_fill = (uint16_t)(ctx->out_fill + n);
-      ctx->remain = (uint16_t)(ctx->remain - n);
+      ctx->remain -= n;
     }
     else
     {
@@ -250,7 +260,7 @@ int fw_delta_feed(fw_delta_ctx_t *ctx, const uint8_t *data, uint32_t len)
         {
           return FW_DELTA_ERR_IO;
         }
-        ctx->out_fill = ctx->remain;
+        ctx->out_fill = (uint16_t)ctx->remain;
         ctx->diff_started = 1u;
         ctx->diff_have = 0u;
         continue;

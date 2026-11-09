@@ -143,7 +143,7 @@ int UdpTransport::read(uint8_t *data, std::size_t len, int timeoutMs)
       QHostAddress dropFrom;
       quint16 dropPort = 0;
       socket.readDatagram(discard.data(), discard.size(), &dropFrom, &dropPort);
-      return -1;    //超长数据报按链路异常上报，不静默丢字节
+      return 0;    //超长数据报不是本协议的应答，丢弃后按本次无数据处理
     }
     QByteArray quick;    //临时接收缓冲
     quick.resize(static_cast<int>(len));
@@ -179,7 +179,7 @@ int UdpTransport::read(uint8_t *data, std::size_t len, int timeoutMs)
         QByteArray discard;    //把整包取出来丢掉，避免残留半个数据报影响后续解析
         discard.resize(static_cast<int>(pending));
         socket.readDatagram(discard.data(), discard.size(), &from, &fromPort);
-        return -1;    //超长数据报按链路异常上报，不静默丢字节
+        continue;    //超长数据报不是本协议的应答，丢弃后继续等待
       }
       QByteArray bytes;    //接收缓冲，按调用方容量分配
       bytes.resize(static_cast<int>(len));    //已确认整包放得下

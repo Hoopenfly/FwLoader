@@ -64,17 +64,25 @@ void fw_strategy_upgrade(void)
   {
     if(fw_strategy_perform() == 0)
     {
-      fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED);//覆写成功，置为已确认
       boot_slot0_ok = (fw_img_crc32_verify(SLOT0_ADDR, SLOT_SIZE, NULL) == FW_IMG_OK) ? 1 : 0;//重新校验覆写结果
       if(boot_slot0_ok)
       {
-        fw_boot_jump_to_app(SLOT0_ADDR);//校验通过才跳转
+        fw_boot_flag_write(FW_BOOT_FLAG_CONFIRMED);//校验通过才置为已确认
+        fw_boot_jump_to_app(SLOT0_ADDR);
+      }
+      else
+      {
+        /*搬页写坏：VERIFY失败时保持VALID，下次上电用SLOT1里完好的镜像重做一次覆写；
+          不能在此写CONFIRMED，否则fw_boot.c的"flag==VALID才重做"分支被挡住，失去唯一恢复路径*/
+        fw_msg_error(FW_MSG_ERR_UPDATE, 0);
       }
     }
     else
     {
+      /*搬页中途失败：SLOT0可能已被擦除或只写了一部分，此处同样保持VALID，
+        让下次上电重新执行一次覆写；若改写成NONE，阶段4的"flag==VALID才允许用SLOT1恢复"
+        会被挡住，而SLOT0又过不了CRC校验，设备只能靠串口重新升级 */
       fw_msg_error(FW_MSG_ERR_UPDATE, 0);
-      fw_boot_flag_write(FW_BOOT_FLAG_NONE);//覆写失败，清除标志避免反复重试
     }
   }
   else

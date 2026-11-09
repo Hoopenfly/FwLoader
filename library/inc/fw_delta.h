@@ -5,9 +5,9 @@
 
 /* ==================== 差分记录格式 ====================
  * 全部小端，记录流描述的是“代码区”，不含镜像元数据：
- *   COPY:    0x01 | src_off u16 | len u16
- *   LITERAL: 0x02 | len u16 | data[len]
- *   DIFF:    0x03 | src_off u16 | len u16 | count u16 | (pos u16, val u8)*count
+ *   COPY:    0x01 | src_off u32 | len u32
+ *   LITERAL: 0x02 | len u32 | data[len]
+ *   DIFF:    0x03 | src_off u32 | len u32 | count u16 | (pos u16, val u8)*count
  *
  * DIFF 表示“旧块 + 稀疏差异”：设备先把旧镜像里的 len 字节读进缓冲，
  * 再按 pos 逐点加上 val（模 256），len 不超过 FW_DELTA_BUF_SIZE。
@@ -57,10 +57,10 @@ typedef struct
   uint32_t old_len;                //旧代码总长
   uint32_t out_len;                //已交给write回调的字节数
   uint32_t src;                    //源偏移(COPY/DIFF)
-  uint16_t remain;                 //当前记录输出字节数(COPY/LITERAL)或DIFF块长
+  uint32_t remain;                 //当前记录输出字节数(COPY/LITERAL)或DIFF块长
   uint16_t out_fill;               //输出缓冲已填字节数
   uint8_t  op;                     //当前记录类型，0=空闲
-  uint8_t  hdr[6];                 //记录头收集缓冲
+  uint8_t  hdr[12];                //记录头收集缓冲
   uint8_t  hdr_have;               //已收集的记录头字节数
   uint8_t  hdr_need;               //当前记录还需要几个头字节
   uint8_t  diff_hdr[3];            //DIFF的(pos u16, val u8)

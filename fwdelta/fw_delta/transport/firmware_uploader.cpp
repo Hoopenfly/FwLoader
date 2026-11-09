@@ -18,9 +18,9 @@ constexpr int kRetryMax = 3;    //同一帧最多发送3次
 //末帧写完后设备要解析全部记录并逐页写Flash，耗时随镜像大小增长
 //因此这里按分钟级等待，不能沿用单帧的3秒超时
 constexpr int kDeltaFinishTimeoutSec = 60;    //最多等1分钟
-//差分记录流末帧只发一次
-//重发会让设备重复解析同一段记录流并重复写Flash，必须等它把上一帧处理完
-constexpr int kDeltaFinishRetry = 1;    //末帧不作重试
+//差分记录流末帧的尝试次数
+//设备端对"帧尾正好落在写入前沿"的重传直接回OK、不重复解析，所以末帧可以安全重发
+constexpr int kDeltaFinishRetry = 2;    //末帧最多发2次，覆盖单次丢包
 
 } // namespace
 
@@ -52,6 +52,28 @@ void FirmwareUploader::setLogSink(const std::function<void(const QString &)> &si
 }
 
 /**
+ * @brief   设置阶段回调，进入或离开"等设备处理"阶段时调用
+ * @param   sink  接收Phase值的回调，空表示不通知
+ */
+void FirmwareUploader::setPhaseSink(const std::function<void(int)> &sink)
+{
+  phaseSink = sink;    //保存回调副本，空回调表示不通知
+}
+
+/**
+ * @brief   广播当前上传阶段
+ * @param   phase  Phase取值
+ */
+void FirmwareUploader::notifyPhase(int phase)
+{
+  //界面可能已经销毁，空回调直接跳过
+  if(phaseSink)
+  {
+    phaseSink(phase);
+  }
+}
+
+/**
  * @brief   发送整包固件
  * @param   code      纯代码(不含镜像元数据)
  * @param   meta    镜像元数据参数，函数内补image_len与code_crc32
@@ -79,6 +101,12 @@ FirmwareUploader::Result FirmwareUploader::sendFull(const std::vector<uint8_t> &
   {
     result.error = QStringLiteral("固件代码为空");    //交给调用方提示
     return result;    //不进入发送流程
+  }
+  //帧偏移是32位：超过4GB的镜像无法用偏移寻址，直接拒绝，避免循环变量回绕后无限重发
+  if(code.size() > 0xFFFFFFFFull)
+  {
+    result.error = QStringLiteral("固件代码超过4GB，超出协议偏移范围");
+    return result;
   }
 
   //镜像元数据中写入代码长度与CRC32
@@ -113,7 +141,7 @@ FirmwareUploader::Result FirmwareUploader::sendFull(const std::vector<uint8_t> &
   }
 
   //按256字节分帧，最后一帧可能更短
-  for(uint32_t offset = 0; offset < code.size(); offset += kChunkSize)    //按偏移逐帧推进
+  for(std::size_t offset = 0; offset < code.size(); offset += kChunkSize)    //按偏移逐帧推进，用64位下标避免末帧回绕
   {
     if(cancelled())    //每帧发送前响应取消请求
     {
@@ -121,13 +149,21 @@ FirmwareUploader::Result FirmwareUploader::sendFull(const std::vector<uint8_t> &
     }
     const uint32_t n = std::min<uint32_t>(kChunkSize,
                                           static_cast<uint32_t>(code.size() - offset));    //本帧实际字节数
-    const std::vector<uint8_t> part(code.begin() + offset, code.begin() + offset + n);    //拷出本帧数据
+    const std::vector<uint8_t> part(code.begin() + static_cast<std::ptrdiff_t>(offset),
+                                    code.begin() + static_cast<std::ptrdiff_t>(offset + n));    //拷出本帧数据
 
-    if(!transact(1, offset, part, respOffset, status, fatal, wasCancelled))    //类型1为数据帧，偏移随帧推进
+    const bool lastFrame = (offset + n >= code.size());    //本帧是否为最后一帧
+    if(lastFrame)    //末帧发出后设备要写元数据并提交升级标志，此后取消只是停止等待
+    {
+      result.waitingDevice = true;    //记录取消语义已从"可停"变为"只能等"
+      notifyPhase(kPhaseWaitDevice);    //界面据此把按钮切成停止等待
+    }
+
+    if(!transact(1, static_cast<uint32_t>(offset), part, respOffset, status, fatal, wasCancelled))    //类型1为数据帧，偏移随帧推进
     {
       if(wasCancelled)    //用户主动取消时按取消返回
       {
-        result.cancelled = true;    //交给界面显示已取消
+        result.cancelled = true;    //交给界面区分"已取消"与"已停止等待"
       }
       else    //其余原因区分链路失败与应答超时
       {
@@ -136,6 +172,11 @@ FirmwareUploader::Result FirmwareUploader::sendFull(const std::vector<uint8_t> &
                              : QStringLiteral("数据帧无应答，偏移 %1").arg(offset);    //注明失败帧位置
       }
       return result;
+    }
+    if(lastFrame)    //末帧已得到应答，设备不再需要额外处理时间
+    {
+      result.waitingDevice = false;    //下次取消仍按立即取消处理
+      notifyPhase(kPhaseSending);    //界面恢复成取消烧录
     }
     if(status != 0)    //设备报错时停止发送，交由上层处理
     {
@@ -188,6 +229,12 @@ FirmwareUploader::Result FirmwareUploader::sendDelta(const fw::DeltaPack &pack,
     result.error = QStringLiteral("差分记录流为空");    //交给调用方提示
     return result;    //不发送任何帧
   }
+  //帧偏移是32位：超过4GB的记录流无法用偏移寻址，直接拒绝，避免循环变量回绕
+  if(pack.payload.size() > 0xFFFFFFFFull)
+  {
+    result.error = QStringLiteral("差分记录流超过4GB，超出协议偏移范围");
+    return result;
+  }
   std::vector<uint8_t> start;    //START_DELTA帧载荷=镜像元数据+基版本CRC32+记录流长度
   start.reserve(meta.size() + 8u);    //预先留出两个32位字段的空间
   start.insert(start.end(), meta.begin(), meta.end());    //先放入镜像元数据
@@ -220,7 +267,7 @@ FirmwareUploader::Result FirmwareUploader::sendDelta(const fw::DeltaPack &pack,
     return result;
   }
 
-  for(uint32_t offset = 0; offset < pack.payload.size(); offset += kChunkSize)    //按偏移逐帧推进
+  for(std::size_t offset = 0; offset < pack.payload.size(); offset += kChunkSize)    //按偏移逐帧推进，用64位下标避免末帧回绕
   {
     if(cancelled())    //每帧发送前响应取消请求
     {
@@ -228,18 +275,23 @@ FirmwareUploader::Result FirmwareUploader::sendDelta(const fw::DeltaPack &pack,
     }
     const uint32_t n = std::min<uint32_t>(kChunkSize,
                                           static_cast<uint32_t>(pack.payload.size() - offset));    //本帧实际字节数
-    const std::vector<uint8_t> part(pack.payload.begin() + offset,
-                                    pack.payload.begin() + offset + n);    //拷出本帧记录流
+    const std::vector<uint8_t> part(pack.payload.begin() + static_cast<std::ptrdiff_t>(offset),
+                                    pack.payload.begin() + static_cast<std::ptrdiff_t>(offset + n));    //拷出本帧记录流
 
     //末帧写完后设备要解析全部记录并逐页写Flash，必须按分钟级等待，且不能重发
     const bool lastFrame = (offset + n >= pack.payload.size());
+    if(lastFrame)    //末帧发出后设备转入自处理，取消只能停止等待
+    {
+      result.waitingDevice = true;    //记录取消语义已从"可停"变为"只能等"
+      notifyPhase(kPhaseWaitDevice);    //界面据此把按钮切成停止等待
+    }
     if(lastFrame && logSink)    //先告诉操作者设备端开始重建镜像，避免界面看起来卡住
     {
       logSink(QStringLiteral("差分包已全部发出，设备端正在重建镜像，最长等待 %1 秒")
               .arg(kDeltaFinishTimeoutSec));
     }
 
-    if(!transact(1, offset, part, respOffset, status, fatal, wasCancelled,
+    if(!transact(1, static_cast<uint32_t>(offset), part, respOffset, status, fatal, wasCancelled,
                  lastFrame ? kDeltaFinishTimeoutSec * 1000 : 0,
                  lastFrame ? kDeltaFinishRetry : 0))    //差分记录流同样用类型1数据帧
     {
@@ -264,6 +316,11 @@ FirmwareUploader::Result FirmwareUploader::sendDelta(const fw::DeltaPack &pack,
         }
       }
       return result;
+    }
+    if(lastFrame)    //末帧已得到应答，设备不再需要额外处理时间
+    {
+      result.waitingDevice = false;    //下次取消仍按立即取消处理
+      notifyPhase(kPhaseSending);    //界面恢复成取消烧录
     }
     if(status != 0)    //设备报错时停止发送，交由上层处理
     {
@@ -346,10 +403,16 @@ bool FirmwareUploader::transact(uint8_t type, uint32_t offset,
     //数据帧的成功应答，偏移必须等于本帧写完后的下一个期望位置，否则视为上一帧的旧应答
     //失败应答携带的是设备期望位置（不连续时为received_size，fail()后为0），不能按同一规则比对，
     //必须原样上报，否则设备返回的错误码会被全部丢弃，界面只能显示“无应答”
-    if(type == 1u && gotStatus == 0u
-       && gotOffset != offset + static_cast<uint32_t>(payload.size()))    //类型1为数据帧
+    if(gotStatus == 0u)
     {
-      continue;    //旧的成功应答，丢弃后重发本帧
+      if(type == 1u && gotOffset != offset + static_cast<uint32_t>(payload.size()))    //类型1为数据帧
+      {
+        continue;    //旧的成功应答，丢弃后重发本帧
+      }
+      if(type != 1u && gotOffset != 0u)    //START/START_DELTA的成功应答offset固定为0
+      {
+        continue;    //同上一条请求的迟到应答，丢弃后重发本帧
+      }
     }
 
     respOffset = gotOffset;    //回填设备确认位置
@@ -401,10 +464,8 @@ bool FirmwareUploader::readResp(uint32_t &offset, uint8_t &status, int timeoutMs
 {
   fatal = false;    //默认没有链路级错误
   cancelled = false;    //默认没有被取消
-  std::vector<uint8_t> buffer;    //累积收到的字节，便于处理半包与粘包
   uint8_t chunk[256];    //单次读取的临时缓冲，放在栈上避免频繁分配
   QElapsedTimer timer;    //使用单调计时器统计已等待时间
-  std::size_t scanned = 0;    //已确认不可能构成帧起始的前缀长度，避免每轮从头重扫
 
   timer.start();    //开始计时
   while(timer.elapsed() < timeoutMs)    //在总超时时间内反复尝试
@@ -422,55 +483,60 @@ bool FirmwareUploader::readResp(uint32_t &offset, uint8_t &status, int timeoutMs
     }
     if(n > 0)    //读到数据就追加到累积缓冲
     {
-      buffer.insert(buffer.end(), chunk, chunk + n);    //把新字节拼到已有数据之后
+      respBuffer.insert(respBuffer.end(), chunk, chunk + n);    //把新字节拼到已有数据之后
     }
     //从上次确认过的位置往后找完整的RESP帧
-    std::size_t i = scanned;
-    while(i + 12 <= buffer.size())    //帧最短12字节，保证下标不越界
+    std::size_t i = respScanned;
+    while(i + 12 <= respBuffer.size())    //帧最短12字节，保证下标不越界
     {
-      if(buffer[i] != 0x55u || buffer[i + 1] != 0xAAu)    //跳过不是帧起始的位置
+      if(respBuffer[i] != 0x55u || respBuffer[i + 1] != 0xAAu)    //跳过不是帧起始的位置
       {
         i++;
         continue;
       }
-      if((buffer[i + 2] & 0x0Fu) != 0x02u)    //高4位为版本，低4位为2表示RESP帧
+      if(respBuffer[i + 2] != 0x12u)    //高4位是协议版本1、低4位2表示RESP帧，两位都要比对
       {
         i++;
         continue;
       }
-      const std::size_t len = static_cast<std::size_t>(buffer[i + 7])
-                            | (static_cast<std::size_t>(buffer[i + 8]) << 8);    //载荷长度，小端16位
-      if(len < 1u)    //RESP至少带1字节状态码，空载荷帧按非法帧跳过
+      const std::size_t len = static_cast<std::size_t>(respBuffer[i + 7])
+                            | (static_cast<std::size_t>(respBuffer[i + 8]) << 8);    //载荷长度，小端16位
+      //RESP载荷固定1字节状态码；给将来扩展留余量，但必须有上界，
+      //否则伪造的长度会让每轮都等不满end，缓冲一路涨到64KB才超时
+      if(len < 1u || len > 259u)    //帧头9+载荷259+CRC2=270字节，与设备端接收缓冲同量级
       {
         i++;
         continue;
       }
       const std::size_t end = i + 9 + len + 2;    //帧尾=帧头9字节+载荷+CRC16
-      if(buffer.size() < end)    //数据还没收全，等下一轮再试
+      if(respBuffer.size() < end)    //数据还没收全，等下一轮再试
       {
         break;    //保留当前位置，下次仍有数据时从帧头继续
       }
-      const uint16_t crcCalc = fw::crc16(buffer.data() + i, 9 + len);    //按收到的内容重算CRC16
-      const uint16_t crcGot = static_cast<uint16_t>(buffer[i + 9 + len])
-                            | (static_cast<uint16_t>(buffer[i + 9 + len + 1]) << 8);    //取出帧尾CRC16
+      const uint16_t crcCalc = fw::crc16(respBuffer.data() + i, 9 + len);    //按收到的内容重算CRC16
+      const uint16_t crcGot = static_cast<uint16_t>(respBuffer[i + 9 + len])
+                            | (static_cast<uint16_t>(respBuffer[i + 9 + len + 1]) << 8);    //取出帧尾CRC16
       if(crcCalc != crcGot)    //校验不符说明数据有误，继续向后找下一帧
       {
         i++;
         continue;
       }
-      offset = static_cast<uint32_t>(buffer[i + 3])
-             | (static_cast<uint32_t>(buffer[i + 4]) << 8)
-             | (static_cast<uint32_t>(buffer[i + 5]) << 16)
-             | (static_cast<uint32_t>(buffer[i + 6]) << 24);    //拼出小端32位确认位置
-      status = buffer[i + 9];    //载荷首字节为状态码
+      offset = static_cast<uint32_t>(respBuffer[i + 3])
+             | (static_cast<uint32_t>(respBuffer[i + 4]) << 8)
+             | (static_cast<uint32_t>(respBuffer[i + 5]) << 16)
+             | (static_cast<uint32_t>(respBuffer[i + 6]) << 24);    //拼出小端32位确认位置
+      status = respBuffer[i + 9];    //载荷首字节为状态码
+      //把这一帧连同它前面的垃圾字节一起消费掉，下次调用从帧后继续
+      respBuffer.erase(respBuffer.begin(), respBuffer.begin() + static_cast<std::ptrdiff_t>(end));
+      respScanned = 0;
       return true;
     }
-    scanned = i;    //记住扫描进度，下一轮从这里继续
+    respScanned = i;    //记住扫描进度，下一轮从这里继续
     //设备持续输出文本时缓冲会一直变长，把已确认无用的前缀丢掉
-    if(scanned >= 4096u)
+    if(respScanned >= 4096u)
     {
-      buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(scanned));
-      scanned = 0;
+      respBuffer.erase(respBuffer.begin(), respBuffer.begin() + static_cast<std::ptrdiff_t>(respScanned));
+      respScanned = 0;
     }
   }
   return false;    //超时仍未解析到有效RESP

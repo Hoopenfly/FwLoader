@@ -174,14 +174,14 @@ void fw_boot_jump_to_app(uint32_t app_addr)
   fw_msg_jump(app_addr);
   fw_port_wait_tx_complete();
   fw_port_irq_disable();
-  //向量表地址须按VTOR_ALIGN_MASK对齐，不满足则报错并停机
+  //向量表地址须按VTOR_ALIGN_MASK对齐，不满足则报错并复位重新选择镜像
   if(app_addr & VTOR_ALIGN_MASK)
   {
     fw_msg_error(FW_MSG_ERR_VTOR_ALIGN, app_addr);
+    /* 地址不对齐无法安全跳转：清掉升级标志后复位，不能关中断死等，
+     * 否则整机只能等看门狗，也失去了重新接收升级包的机会 */
     fw_boot_flag_write(FW_BOOT_FLAG_NONE);
-    while(1)
-    {
-    }
+    fw_port_system_reset();
   }
   //关闭时基、重定位向量表、设置栈指针并跳转，不返回
   fw_port_jump_to_app(app_addr);

@@ -12,6 +12,9 @@
 //取128字节而非256：该函数的栈帧与fw_img_locate()的扫描缓冲同时存在，小块能把峰值压住
 #define FW_IMG_CRC32_CHUNK   128u
 
+//初始栈顶相对RAM基址至少保留的可用栈空间：更小的栈顶视为镜像损坏，跳转后首次压栈即可能越界
+#define FW_IMG_MSP_MIN       0x100u
+
 /* 半字节查表(16项，64字节)：标准反射CRC32，多项式0xEDB88320。
  * 每字节分两次查表，等价于8次移位判断，结果与上位机一致。 */
 static const uint32_t crc32_nibble_table[16] =
@@ -261,13 +264,13 @@ int fw_img_vectors_ok(uint32_t addr)
   //按本机端序拷贝，向量表是MCU自己写进去的，不参与跨设备格式
   memcpy(&msp, vec, sizeof(msp));
   memcpy(&reset_addr, vec + sizeof(msp), sizeof(reset_addr));
-  //初始栈顶必须落在RAM内
-  if(msp < RAM_BASE_ADDR || msp >= RAM_END_ADDR)
+  //初始栈顶必须落在RAM内、8字节对齐，并至少留出最小可用栈空间
+  if(((msp & 0x7u) != 0u) || msp < (RAM_BASE_ADDR + FW_IMG_MSP_MIN) || msp > RAM_END_ADDR)
   {
     return FW_IMG_ERR_VECTOR;
   }
-  //复位向量必须落在主Flash内
-  if(reset_addr < FLASH_BASE_ADDR || reset_addr >= (FLASH_BASE_ADDR + FLASH_TOTAL_SIZE))
+  //复位向量必须落在应用区，不能指向BootLoader或Flash之外
+  if(reset_addr < SLOT0_ADDR || reset_addr >= (FLASH_BASE_ADDR + FLASH_TOTAL_SIZE))
   {
     return FW_IMG_ERR_VECTOR;
   }

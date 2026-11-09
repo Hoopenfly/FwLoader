@@ -57,12 +57,20 @@ int fw_port_read_frame(uint8_t *buf, uint16_t maxlen, uint16_t *len)
 
 
 #endif /* FW_BOOT_BUILD_LOADER == 0 */
+//临时诊断标记：升级收尾卡死时用JLink读该变量定位停在哪一步
+
 /**
 * @brief   发送一段数据，等待发送完成
 */
 void fw_port_send_buf(const uint8_t *buf, uint16_t len)
 {
-  uint32_t t0;
+  uint32_t t0 = HAL_GetTick();
+
+  /* 发之前先等发送队列腾空：comSendBuf是非阻塞入队，FIFO满时会静默丢字节，
+   * 响应帧只有十几字节，多等这一下换来应答不丢 */
+  while(!UartTxEmpty(COM1) && (HAL_GetTick() - t0) < 100u)
+  {
+  }
   comSendBuf(COM1, buf, len);
   //最长等待100ms，超时返回，不阻塞升级流程
   t0 = HAL_GetTick();
@@ -223,12 +231,25 @@ void fw_port_jump_to_app(uint32_t app_addr)
   SysTick->VAL = 0;
   //向量表重定位到应用
   SCB->VTOR = app_addr;
-  //设置主栈指针并跳转
+  __DSB();
+  __ISB();
+  //设置主栈指针
   __set_MSP(*(volatile uint32_t *)app_addr);
+  /* 先切换到App的栈再开中断：此时VTOR与MSP都已是App的，若中断恰好到来也不会
+     用BootLoader的栈去跑App的向量。App的启动代码不一定自己会开中断，
+     而fw_boot_jump_to_app在调用本函数前关过中断，所以这里必须恢复 */
+  __enable_irq();
+  //跳转到应用复位入口
   ((app_func_t)(*(volatile uint32_t *)(app_addr + 4u)))();
   while(1)
   {
   }
+}
+
+void fw_port_system_reset(void)
+{
+  //NVIC_SystemReset不返回，复位后重走BootLoader的镜像选择流程
+  NVIC_SystemReset();
 }
 /* ==================== fw_kv 临界区 ==================== */
 /* 两种实现由configUSE_FREERTOS选择：无OS关中断，有OS用互斥锁。
@@ -238,8 +259,10 @@ void fw_port_jump_to_app(uint32_t app_addr)
 #endif
 
 #if (configUSE_FREERTOS == 0)
-//进入临界区前的PRIMASK，退出时原样恢复
+//最外层进入前的PRIMASK，退出时原样恢复
 static uint32_t s_kv_primask;
+//嵌套层数：支持临界区内再次加锁，避免内层退出时提前开中断
+static uint32_t s_kv_nest;
 #endif
 
 #if (configUSE_FREERTOS == 1)
@@ -252,7 +275,8 @@ void fw_port_kv_crit_init(void)
 {
   if(g_kv_mutex == NULL)
   {
-    g_kv_mutex = xSemaphoreCreateMutex();
+    /* 用递归互斥量：临界区内若再次调用KV接口（例如日志回调里读写KV）不会自锁 */
+    g_kv_mutex = xSemaphoreCreateRecursiveMutex();
   }
 }
 
@@ -261,7 +285,12 @@ void fw_port_kv_crit_lock(void)
   fw_port_kv_crit_init();
   if(g_kv_mutex != NULL)
   {
-    xSemaphoreTake(g_kv_mutex, portMAX_DELAY);
+    (void)xSemaphoreTakeRecursive(g_kv_mutex, portMAX_DELAY);
+  }
+  else
+  {
+    /* 创建失败（堆不足）时退回关中断：宁可牺牲一点实时性，也不能在没有保护的情况下擦写Flash */
+    __disable_irq();
   }
 }
 
@@ -269,7 +298,11 @@ void fw_port_kv_crit_unlock(void)
 {
   if(g_kv_mutex != NULL)
   {
-    xSemaphoreGive(g_kv_mutex);
+    (void)xSemaphoreGiveRecursive(g_kv_mutex);
+  }
+  else
+  {
+    __enable_irq();
   }
 }
 #else
@@ -280,15 +313,27 @@ void fw_port_kv_crit_init(void)
 
 void fw_port_kv_crit_lock(void)
 {
-  //先存再关：嵌套进入时内层存到的是1，退出后仍保持屏蔽
-  s_kv_primask = __get_PRIMASK();
-  __disable_irq();
+  //只在最外层进入时保存状态并关中断，嵌套进入只递增计数
+  if(s_kv_nest == 0u)
+  {
+    s_kv_primask = __get_PRIMASK();
+    __disable_irq();
+  }
+  s_kv_nest++;
 }
 
 void fw_port_kv_crit_unlock(void)
 {
-  //按进入前的状态恢复，避免在已有临界区内调用时提前开中断
-  __set_PRIMASK(s_kv_primask);
+  if(s_kv_nest == 0u)
+  {
+    return;//未加锁就解锁，忽略
+  }
+  s_kv_nest--;
+  //退回最外层才恢复进入前的状态，避免内层退出时提前开中断
+  if(s_kv_nest == 0u)
+  {
+    __set_PRIMASK(s_kv_primask);
+  }
 }
 #endif
 
@@ -316,6 +361,7 @@ void fw_assert_fail(const char *cond, const char *file, uint32_t line)
       }
     }
   }
+  //输出断言位置与条件，便于定位；日志走串口，超长会被截断
   fw_port_log_printf("[ASSERT] %s:%u %s\r\n",
       (base != NULL) ? base : "?", (unsigned)line, (cond != NULL) ? cond : "?");
   //等待本行发送完成，避免复位截断断言日志

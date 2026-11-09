@@ -340,11 +340,16 @@ Window {
                                 Layout.minimumWidth: 0          //允许压缩，保证两半等分
                                 Layout.preferredWidth: 0        //从零开始算，宽度只由权重决定
                                 Layout.preferredHeight: 28      //与其他行控件同高
-                                text: FwBridge.busy ? "取消烧录" : "开始烧录"   //烧录中变成取消按钮
+                                //发送阶段取消能立刻停住；数据已发完时设备在自行重建，只能停止等待
+                                text: !FwBridge.busy ? "开始烧录"
+                                                      : (FwBridge.flashPhase === 1 ? "停止等待" : "取消烧录")
                                 enabled: true                                    //始终保持蓝色可点击，缺少前置条件时由日志提示
-                                toolTipText: FwBridge.busy ? "请求取消当前烧录，已发出的数据帧处理完后生效"
-                                                           : (!FwBridge.connected ? "尚未打开通道，点击后会提示先连接"
-                                                                                  : "开始烧录，有差分包时自动走差分，否则发整包")
+                                toolTipText: !FwBridge.busy
+                                             ? (!FwBridge.connected ? "尚未打开通道，点击后会提示先连接"
+                                                                    : "开始烧录，有差分包时自动走差分，否则发整包")
+                                             : (FwBridge.flashPhase === 1
+                                                ? "数据已全部发给设备，设备正在重建并提交镜像；此处只能停止等待，撤不回本次升级，此间不要断电"
+                                                : "请求取消当前烧录，已发出的数据帧处理完后生效")
                                 onClicked: {
                                     if(FwBridge.busy)            //烧录进行中：转为取消请求
                                     {
@@ -355,7 +360,9 @@ Window {
                                         //烧录只需要一个"目标固件"来源，新框留空时用旧框：整包发送的就是它，差分真正发送的是差分包
                                         //"生成差分"才需要新旧两个固件来算差异，与这里的取源无关
                                         var src = newField.text
-                                        if(src.length === 0)
+                                        if(src.length === 0 && outField.text.length > 0)
+                                            src = ""            //带差分包时不能回退成旧固件，否则会静默烧掉旧镜像
+                                        else if(src.length === 0)
                                             src = oldField.text
                                         FwBridge.startFlash(src, outField.text)
                                     }
@@ -610,17 +617,24 @@ Window {
 
                     TextArea {
                         id: logArea                             //日志文本区
-                        //日志整段刷新：末尾的帧号与进度两行需要原地更新，无法只追加尾部
-                        Component.onCompleted: text = FwBridge.logText  //首次加载时一次性填入已有日志
+                        property int logHtmlLen: 0              //已渲染进文本区的富文本长度，用于判断是否需要整段重设
+                        //日志一般走增量追加；只有清空、裁剪或末尾进度行刷新时才整段重设
+                        Component.onCompleted: {
+                            text = FwBridge.logText             //首次加载时一次性填入已有日志
+                            logHtmlLen = FwBridge.logText.length    //记下已渲染长度
+                        }
                         Connections {
                             target: FwBridge
-                            function onLogTextChanged() {            //C++日志变化时整段重绘
+                            function onLogTextChanged() {            //全文变化：清空、裁剪后需要整段重设
+                                if (FwBridge.logText.length === logArea.logHtmlLen)
+                                    return                          //长度未变，增量追加已经处理过
                                 var ci = logScroll.contentItem       //滚动区内容项
                                 var atBottom = (ci.contentHeight - ci.contentY - logScroll.height) < 8    //判断是否停在底部
                                 var keepY = ci.contentY              //记住当前滚动位置
                                 var selStart = logArea.selectionStart    //记住拖选范围，整段赋值会清掉选择
                                 var selEnd = logArea.selectionEnd
                                 logArea.text = FwBridge.logText      //整段赋值，末尾两行随之刷新
+                                logArea.logHtmlLen = FwBridge.logText.length    //同步已渲染长度
                                 if(selEnd > selStart)                //之前有选中时按原下标恢复，越界部分夹到文本末尾
                                     logArea.select(Math.min(selStart, logArea.length),
                                                    Math.min(selEnd, logArea.length))
@@ -628,6 +642,29 @@ Window {
                                     ci.contentY = Math.max(0, ci.contentHeight - logScroll.height)
                                 else                                 //原来在中间或顶部时保持原位
                                     ci.contentY = keepY
+                            }
+                            function onProgressLineChanged() {   //仅进度行变化：只替换末尾两行
+                                var ci = logScroll.contentItem       //滚动区内容项
+                                var atBottom = (ci.contentHeight - ci.contentY - logScroll.height) < 8    //判断是否停在底部
+                                var full = FwBridge.logText          //含进度行的最新全文
+                                var base = FwBridge.logBodyLength    //历史日志长度，进度行从 base 开始
+                                if (base > 0 && base <= logArea.length) {
+                                    logArea.remove(base, logArea.length)    //删掉旧进度行
+                                    logArea.insert(base, full.substring(base))    //写入新进度行
+                                } else {
+                                    logArea.text = full               //结构异常时退回整段赋值
+                                }
+                                logArea.logHtmlLen = full.length
+                                if (atBottom)                        //原来在底部时继续跟随到底部
+                                    ci.contentY = Math.max(0, ci.contentHeight - logScroll.height)
+                            }
+                            function onLogSegmentAppended(html) {    //尾部新增日志：只追加，避免整段复制
+                                var ci = logScroll.contentItem       //滚动区内容项
+                                var atBottom = (ci.contentHeight - ci.contentY - logScroll.height) < 8    //判断是否停在底部
+                                logArea.append(html)                 //追加增量片段
+                                logArea.logHtmlLen += html.length    //累加已渲染长度
+                                if(atBottom)                         //原来在底部时继续跟随到底部
+                                    ci.contentY = Math.max(0, ci.contentHeight - logScroll.height)
                             }
                         }
                         textFormat: TextEdit.RichText           //日志带颜色标记，按富文本渲染

@@ -42,7 +42,9 @@ class FwBridge : public QObject
   Q_PROPERTY(QStringList portNames READ portNames NOTIFY portsChanged)        //串口短名列表，供下拉框直接绑定
   Q_PROPERTY(QStringList localIps READ localIps NOTIFY localIpsChanged)       //本机IPv4地址列表
   Q_PROPERTY(int progress READ progress NOTIFY progressChanged)               //升级进度，0~100
+  Q_PROPERTY(int flashPhase READ flashPhase NOTIFY flashPhaseChanged)         //上传阶段，0发送中、1等设备处理
   Q_PROPERTY(QString logText READ logText NOTIFY logTextChanged)              //日志全文，供界面显示与保存
+Q_PROPERTY(int logBodyLength READ logBodyLength NOTIFY logTextChanged)      //日志正文长度（不含末尾进度行），供界面只替换进度行
   Q_PROPERTY(QString plainLogText READ plainLogText NOTIFY logTextChanged)    //日志纯文本，供导出使用
   Q_PROPERTY(double deltaPercent READ deltaPercent NOTIFY deltaStatsChanged)  //差分率，差分包占新固件的百分比
   Q_PROPERTY(qint64 oldSize READ oldSize NOTIFY deltaStatsChanged)            //旧固件字节数
@@ -104,9 +106,18 @@ public:
    */
   int progress() const;
   /**
+   * @brief   当前上传阶段，0表示还在发送、1表示已在等设备处理
+   * @note    阶段为1时数据已全部到达设备，取消只能停止等待，撤不回本次升级
+   */
+  int flashPhase() const;
+  /**
    * @brief   日志全文
    */
   QString logText() const;
+  /**
+   * @brief   日志正文长度（不含末尾进度行）
+   */
+  int logBodyLength() const;
   /**
    * @brief   日志纯文本，供导出使用
    */
@@ -267,8 +278,11 @@ signals:
   void portsChanged();                  //串口列表变化
   void logAdded(int kind, const QString &stamp, const QString &text);   //新增一行日志，kind为来源分类
   void progressChanged(int percent);    //升级进度变化
+  void flashPhaseChanged();             //上传阶段变化，界面据此切换按钮文字
   void framesChanged(uint32_t frameCurrent, uint32_t frameTotal);    //升级帧号变化
-  void logTextChanged();                //日志全文变化
+  void logTextChanged();                //日志全文变化（清空、裁剪或进度行刷新时发出）
+  void progressLineChanged();           //仅末尾进度行变化，界面只替换进度行，避免整段重绘
+  void logSegmentAppended(const QString &html);    //日志尾部新增片段，界面按增量追加，避免整段重绘
   void deltaStatsChanged();             //差分统计变化
   void deltaPathChanged();              //差分包实际落盘路径变化
   void deviceInfoChanged();             //设备信息变化
@@ -305,7 +319,9 @@ private:
   void onClientsChanged(const QStringList &names, const QVariantList &rows);  //传输线程客户端列表变化
   void onRunnerProgress(int percent);               //传输线程升级进度
   void onRunnerStatus(const QString &text);         //传输线程状态文字
-  void onFlashFinished(bool ok, bool linkBroken, const QString &message);  //传输线程升级结束，linkBroken表示链路已断
+  void onFlashFinished(bool ok, bool linkBroken, bool stoppedWaiting,
+                       const QString &message);  //传输线程升级结束，stoppedWaiting表示设备仍在自处理
+  void onFlashPhaseChanged(int phase);              //传输线程上报上传阶段
   void onFramesChanged(uint32_t frameCurrent, uint32_t frameTotal);  //传输线程上报帧号
   void onRawBytes(const QByteArray &bytes);         //收到设备主动发来的原始字节
   void onLinkLost(const QString &reason);           //链路断开时复位界面连接状态
@@ -327,6 +343,8 @@ private:
   int m_transportType = -1;                    //当前通道类型，升级结束后据此恢复客户端轮询
   int m_role = 0;                              //当前通道角色，0客户端、1服务器
   int m_progress = 0;                          //升级进度，0~100
+  int m_flashPhase = 0;                        //上传阶段，0发送中、1等设备处理
+  qint64 m_deviceBusyUntilMs = 0;              //设备自处理预计结束时刻，此前拒绝发起新升级
   QString m_status;                            //当前状态文字
   QString m_logText;                           //日志全文
   int m_logCount = 0;                          //日志行数，超过上限时触发裁剪
@@ -338,7 +356,7 @@ private:
   uint32_t m_frameTotal = 0;                   //本次总帧数
   QTimer *m_listenTimer = nullptr;             //非升级阶段的被动读取定时器
   QByteArray m_rxBuffer;                       //接收缓冲，用于拆出协议帧与文本
-  QString m_textBuffer;                        //按行累积的设备打印文本
+  QByteArray m_textBuffer;                     //按行累积的设备打印原始字节，行尾才解码UTF-8
   QString m_deviceInfo;                        //设备信息
   QString m_clientInfo;                        //当前客户端信息
   QStringList m_clientList;                    //客户端名称缓存，避免界面线程直接访问传输层

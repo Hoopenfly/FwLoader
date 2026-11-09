@@ -49,6 +49,10 @@ uint32_t get_u32(const uint8_t *p)
  */
 std::vector<uint8_t> build_fwd(const DeltaPack &pack)
 {
+  if(pack.payload.empty())  //空记录流无法组成有效差分包
+  {
+    return std::vector<uint8_t>();  //交给调用方按失败处理
+  }
   std::vector<uint8_t> out;  //输出文件字节
   const std::vector<uint8_t> meta = build_meta(pack.meta);  //按镜像元数据生成64字节
 
@@ -70,7 +74,7 @@ std::vector<uint8_t> build_fwd(const DeltaPack &pack)
  * @param   pack  输出
  * @return  true成功
  */
-bool parse_fwd(const std::vector<uint8_t> &data, DeltaPack &pack)
+bool parse_fwd(std::vector<uint8_t> data, DeltaPack &pack)
 {
   if(data.size() < kFileHdrLen)                             //长度不足一个完整文件头
   {
@@ -95,7 +99,9 @@ bool parse_fwd(const std::vector<uint8_t> &data, DeltaPack &pack)
   {
     return false;                                           //长度不一致，拒绝半包或多余数据
   }
-  result.payload.assign(data.begin() + kFileHdrLen, data.end());  //拷贝记录流本体
+  //丢掉文件头后直接接管剩余字节，避免整文件与记录流各占一份内存
+  data.erase(data.begin(), data.begin() + static_cast<std::ptrdiff_t>(kFileHdrLen));
+  result.payload = std::move(data);                         //记录流本体移入结果
   pack = std::move(result);                                 //结果整体移到输出参数
   return true;                                              //解析成功
 }
@@ -128,8 +134,16 @@ bool write_fwd(const std::string &path, const DeltaPack &pack)
   }
   //替换前先把旧文件改名备份，替换成功后再删除备份；任一步失败都能恢复原文件
   const std::string bakPath = path + ".bak";                 //旧文件备份路径
-  std::remove(bakPath.c_str());                              //清掉上一次可能残留的备份
-  const bool hadOld = (std::rename(path.c_str(), bakPath.c_str()) == 0);  //旧文件存在时改名备份
+  bool hadOld = false;                                       //目标文件是否存在并已在备份位
+  if(std::ifstream(path, std::ios::binary).good())           //只在确实存在旧文件时才做备份
+  {
+    hadOld = (std::rename(path.c_str(), bakPath.c_str()) == 0);  //旧文件改名备份
+    if(!hadOld)                                              //备份名被占用时清掉残留再试一次
+    {
+      std::remove(bakPath.c_str());                          //删除上一次残留的备份
+      hadOld = (std::rename(path.c_str(), bakPath.c_str()) == 0);  //重试改名
+    }
+  }
 
   if(std::rename(tmpPath.c_str(), path.c_str()) != 0)        //临时文件原子替换目标文件
   {
@@ -161,9 +175,9 @@ bool read_fwd(const std::string &path, DeltaPack &pack)
   {
     return false;                                            //打开失败
   }
-  const std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)),
-                                  std::istreambuf_iterator<char>());  //一次性读入全部文件内容
-  return parse_fwd(data, pack);                              //交给解析函数校验格式
+  std::vector<uint8_t> data((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());  //一次性读入全部文件内容
+  return parse_fwd(std::move(data), pack);                   //交给解析函数校验格式，字节直接移交
 }
 
 } // namespace fw
